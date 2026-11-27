@@ -340,12 +340,12 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
             let waited = WaitForSingleObject(a.event, INFINITE);
             if waited != windows::Win32::Foundation::WAIT_OBJECT_0 {
-                return Err(windows::core::Error::from_win32());
+                return Err(windows::core::Error::from_thread());
             }
         }
         let complete = a.fence.GetCompletedValue();
         if complete == u64::MAX || complete < a.value {
-            return Err(windows::core::Error::from_win32());
+            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
         }
         if batch {
             a.covered.complete(snapshot);
