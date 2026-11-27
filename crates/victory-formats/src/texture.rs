@@ -716,6 +716,13 @@ impl Layout {
             for z in 0..depth {
                 let (s, _) = self.split(first + z);
                 let base = u64::from(s) * self.slice_size + m.offset;
+                // The guest pitch and host pitch both match the logical row.
+                // Copy the whole subresource plane in one contiguous operation;
+                // never include padding rows or adjacent mips/slices.
+                if m.pitch == m.width && row_pitch == bytes {
+                    copy_run::<DETILE>(src, dst, base as usize, z as usize * depth_pitch, slice_bytes);
+                    continue;
+                }
                 for y in 0..m.height {
                     let tiled_row = (base + u64::from(y) * u64::from(m.pitch) * n as u64) as usize;
                     let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
@@ -1569,6 +1576,44 @@ mod tests {
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
         assert!(!t.planes[0].layout.addressable());
+    }
+
+    #[test]
+    fn contiguous_linear_planes_preserve_mips_slices_and_padding() {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 3,
+            ..desc(256, 7, 2, 4, Swizzle::LINEAR)
+        }).unwrap();
+        let mip = 1;
+        let m = &layout.mips[mip as usize];
+        let bytes = m.width as usize * 4;
+        assert_eq!(m.pitch, m.width);
+        let plane = bytes * m.height as usize;
+        let pitch = plane + 19;
+        let len = pitch * (m.depth as usize - 1) + plane;
+        let mut linear = vec![0x99; len];
+        for z in 0..m.depth as usize {
+            for i in 0..plane {
+                linear[z * pitch + i] = (i.wrapping_mul(13) + z) as u8;
+            }
+        }
+        let mut tiled = vec![0x5a; layout.size as usize];
+        let mut expected = tiled.clone();
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                for x in 0..m.width {
+                    let a = layout.offset(mip, x, y, z).unwrap() as usize;
+                    let b = z as usize * pitch + y as usize * bytes + x as usize * 4;
+                    expected[a..a + 4].copy_from_slice(&linear[b..b + 4]);
+                }
+            }
+        }
+        layout.tile(&mut tiled, mip, 0, &linear, bytes, pitch).unwrap();
+        assert_eq!(tiled, expected);
+        let mut back = vec![0x99; len];
+        layout.detile(&tiled, mip, 0, &mut back, bytes, pitch).unwrap();
+        assert_eq!(back, linear);
     }
 
     #[test]
