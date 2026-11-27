@@ -86,7 +86,7 @@ LOG_SAMPLE = re.compile(
 
 
 def log_samples(path):
-    samples, reasons, mapping, passes, budgets, gpu_spans = [], [], [], [], [], []
+    samples, reasons, mapping, passes, budgets, gpu_spans, coalesced = [], [], [], [], [], [], []
     with open(path, errors="replace") as file:
         for line in file:
             if match := LOG_SAMPLE.search(line):
@@ -96,8 +96,11 @@ def log_samples(path):
                 reasons.append({"per_frame": float(match[1]), "reason": match[2].strip()})
             if match := re.search(r"new card memory waited for until it is mapped .*since the start: (\d+) times, ([\d.]+) ms, the longest ([\d.]+) ms", line):
                 mapping.append({"barriers": int(match[1]), "cumulative_ms": float(match[2]), "longest_ms": float(match[3])})
-            if match := re.search(r"the card: (\d+) MB in use of a budget of (\d+) MB, (\d+) MB of the PC's memory shared", line):
-                budgets.append({"local_used_mb": int(match[1]), "local_budget_mb": int(match[2]), "nonlocal_used_mb": int(match[3])})
+            if match := re.search(r"the card's own: budget (\d+) MB, in use (\d+) MB, \d+ MB could still be reserved, \d+ MB reserved; the PC's shared with the card: budget (\d+) MB, in use (\d+) MB", line):
+                budgets.append({"local_used_mb": int(match[2]), "local_budget_mb": int(match[1]), "nonlocal_used_mb": int(match[4]), "nonlocal_budget_mb": int(match[3])})
+            if "mapping barrier requests coalesced" in line:
+                if match := re.search(r"\bn=(\d+)", line):
+                    coalesced.append(int(match[1]))
             if match := re.search(r"the card's time by command \(timing run\): ([\d.]+) ms a frame in ([\d.]+) commands a frame, the longest ([\d.]+) ms: (.*)", line):
                 passes.append({"gpu_timestamp_ms_per_frame": float(match[1]), "commands_per_frame": float(match[2]), "longest_ms": float(match[3]), "command": match[4].strip()})
             if match := re.search(r"the card's own stamps per frame: ([\d.]+) submissions, working ([\d.]+) ms, idle between them ([\d.]+) ms, the longest ([\d.]+) ms", line):
@@ -106,6 +109,7 @@ def log_samples(path):
     return {"periodic_frame_samples": samples, "periodic_drop_reasons": reasons,
             "gpu_queue_timestamp_samples_delayed": gpu_spans,
             "mapping_barriers_last": mapping[-1] if mapping else None,
+            "coalesced_mapping_requests_last_reported": coalesced[-1] if coalesced else None,
             "gpu_memory_budget_samples": budgets,
             "gpu_timestamp_command_samples": passes,
             "steady_state_established": False if any(
@@ -192,8 +196,13 @@ def selftest():
             f.write("the card's time by command (timing run): 1.25 ms a frame in 2.0 commands a frame, the longest 0.8 ms: draw [test]\n")
         with log.open("a") as f:
             f.write("the card's own stamps per frame: 41.0 submissions, working 235.0 ms, idle between them 27.0 ms, the longest 90.0 ms\n")
+            f.write("video memory as the system counts it, here: the card's own: budget 21000 MB, in use 17000 MB, 4000 MB could still be reserved, 0 MB reserved; the PC's shared with the card: budget 14000 MB, in use 3000 MB, 11000 MB could still be reserved, 0 MB reserved\n")
+            f.write("mapping barrier requests coalesced n=1000\n")
         logs = log_samples(log)
         assert logs["gpu_queue_timestamp_samples_delayed"][0]["gpu_busy_ms_per_frame"] == 235
+        assert logs["gpu_memory_budget_samples"][0]["local_budget_mb"] == 21000
+        assert logs["gpu_memory_budget_samples"][0]["nonlocal_used_mb"] == 3000
+        assert logs["coalesced_mapping_requests_last_reported"] == 1000
         assert logs["periodic_frame_samples"][0]["gpu_wait_ms"] == 20
         assert logs["periodic_frame_samples"][1]["pending_pipelines"] == 7
         assert logs["steady_state_established"] is False
