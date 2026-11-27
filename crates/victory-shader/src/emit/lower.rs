@@ -266,6 +266,12 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+#[derive(Clone, Copy)]
+enum WaveBase {
+    Single,
+    Counter(u32),
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -371,9 +377,9 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
-    /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
-    /// handed to host waves (`wave_base`), and the base made in the entry block.
-    halves: Option<u32>,
+    /// A console wave64 program in host waves of 32: one host wave, or the LDS counter
+    /// handing console threads to multiple host waves (`wave_base`).
+    halves: Option<WaveBase>,
     wave_base: Option<V>,
     /// A partial final group (`USER_DISPATCH_THREADS_X`) whose console waves are two host
     /// waves: the threads past the count stay for the exchange's group barriers, so they
@@ -1701,7 +1707,7 @@ thread_local! {
     pub(super) static THREAD_MAX_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 pub(super) use THREAD_MAX_WAVE as TEST_HOST_WAVE;
 
 /// Override the detected wave width for the current translation worker.
@@ -1989,8 +1995,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
-        // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
-        let mut halves: Option<u32> = None;
+        // a console wave64 program in host waves of 32: its thread relabelling
+        let mut halves = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -2072,7 +2078,9 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                if group > 32 {
+                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -2118,8 +2126,13 @@ impl<'a> Lower<'a> {
             }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                halves = Some(if group <= 32 {
+                    WaveBase::Single
+                } else {
+                    let slot = s.lds_dwords;
+                    s.lds_dwords += 1;
+                    WaveBase::Counter(slot)
+                });
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -4829,7 +4842,12 @@ impl<'a> Lower<'a> {
     /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
     /// found. Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = match self.halves? {
+            // The small-group exchange path already requires the whole group to fit
+            // in one host wave. Its first console thread is necessarily zero.
+            WaveBase::Single => return Some(self.s.m.i32(0)),
+            WaveBase::Counter(slot) => slot,
+        };
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -5629,16 +5647,26 @@ impl<'a> Lower<'a> {
         };
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
-        let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
-        let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let lo = self.s.m.extract(c, r, 0);
+        let z = self.s.m.i32(0);
         // FirstbitLo (dx.op 32): the lowest set bit
         let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
-        let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
-        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
         let in_lo = self.s.m.cmp(c, pred::NE, lo, z);
-        let in_hi = self.s.m.cmp(c, pred::NE, hi, z);
-        let any = self.s.m.bin(c, Bin::Or, in_lo, in_hi);
-        let lane = self.s.m.select(c, in_lo, flo, fhi);
+        let (any, lane) = if self.s.wave_size == Some(32) {
+            // Ballot bits beyond the required host wave size are always clear.
+            // Only the lower word can name a live lane; the empty case below
+            // still shuffles from a safe lane and returns the original fallback.
+            (in_lo, flo)
+        } else {
+            let hi = self.s.m.extract(c, r, 1);
+            let k32 = self.s.m.i32(32);
+            let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+            let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+            let in_hi = self.s.m.cmp(c, pred::NE, hi, z);
+            let any = self.s.m.bin(c, Bin::Or, in_lo, in_hi);
+            let lane = self.s.m.select(c, in_lo, flo, fhi);
+            (any, lane)
+        };
         // no lane in EXEC: read this lane (one that is here); the read is not used
         let me = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let lane = self.s.m.select(c, any, lane, me);
@@ -13968,6 +13996,95 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A synthetic wave64 program needing console lane numbers, lowered for the
+    /// requested host wave width without creating a GPU device.
+    fn with_wave_lower(threads: [u32; 3], host_wave: u32, f: impl FnOnce(&mut super::Lower<'_>)) {
+        let words = [0xD765_0001u32, 0x0001_00C1, S_ENDPGM]; // v_mbcnt_lo_u32_b32 v1, -1, 0
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = std::collections::HashMap::new();
+        let was = super::TEST_HOST_WAVE.replace(Some(host_wave));
+        let mut l = super::Lower::new(&parts, &bad);
+        super::TEST_HOST_WAVE.set(was);
+        f(&mut l);
+    }
+
+    fn count(c: &super::super::bitcode::census::Census, kind: &str) -> u32 {
+        let n = super::super::bitcode::census::KINDS.iter().position(|&k| k == kind).unwrap();
+        c.counts[n]
+    }
+
+    #[test]
+    fn a_single_host_wave_needs_no_lds_for_console_thread_numbers() {
+        for threads in [[1, 1, 1], [16, 1, 1], [32, 1, 1], [8, 4, 1], [33, 1, 1], [64, 1, 1], [128, 1, 1]] {
+            with_wave_lower(threads, 32, |l| {
+                assert_eq!(l.s.wave_size, Some(32));
+                let groups = threads.iter().product::<u32>();
+                let single = groups <= 32;
+                let zero = l.s.m.i32(0);
+                let base = l.wave_base().unwrap();
+                assert_eq!(base == zero, single);
+                assert_eq!(l.wave_base(), Some(base));
+                let _lane = l.console_thread();
+                let (lo, hi) = l.exchange_halves(l.s.entry, base);
+                if single {
+                    assert_eq!((lo, hi), (base, zero));
+                }
+                assert_eq!(l.s.lds_dwords, if single { 0 } else { 1 + 2 * groups.div_ceil(64) });
+                l.s.m.terminate(l.s.entry, super::Term::Ret);
+                let c = l.s.m.census();
+                assert_eq!(count(&c, "atomic"), u32::from(!single));
+                assert_eq!(count(&c, "barrier"), if single { 0 } else { 3 });
+                assert_eq!(count(&c, "lds_store"), if single { 0 } else { 2 });
+                assert_eq!(count(&c, "lds_load"), if single { 0 } else { 2 });
+                l.s.m.write();
+            });
+        }
+    }
+
+    #[test]
+    fn a_guarded_first_lane_read_only_searches_the_words_of_the_host_wave() {
+        for (host_wave, expected_words) in [(32, 1), (64, 2)] {
+            with_wave_lower([64, 1, 1], host_wave, |l| {
+                assert_eq!(l.s.wave_size, Some(host_wave));
+                let c = l.s.entry;
+                let x = l.lane_index();
+                let zero = l.s.m.i32(0);
+                let g = l.s.m.cmp(c, super::pred::NE, x, zero);
+                let (_, _) = l.first_live_lane(x, Some(g));
+                l.s.m.terminate(c, super::Term::Ret);
+                let census = l.s.m.census();
+                assert_eq!(count(&census, "extract"), expected_words);
+                assert_eq!(count(&census, "math_call"), expected_words); // FirstbitLo
+                assert_eq!(count(&census, "select"), if host_wave == 32 { 2 } else { 3 });
+                assert_eq!(count(&census, "wave_op"), 5); // incl. safe-lane shuffle and fallback
+                l.s.m.write();
+            });
+        }
+    }
 
     #[test]
     fn divergent_lds_atomics_need_instruction_order_between_halves() {
