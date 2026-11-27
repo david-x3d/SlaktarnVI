@@ -83,6 +83,8 @@ pub mod queue;
 pub mod replay;
 #[cfg(windows)]
 mod residency;
+#[cfg(any(test, windows))]
+mod residency_batch;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
