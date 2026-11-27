@@ -26,16 +26,47 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BASE = HERE.parent  # the folder with run-7900.sh, game/, the Proton copy
-SETTINGS_FILE = BASE / "victory-data" / "launcher.json"
-LOG_FILE = BASE / "valhalla.log"
-# The program: bin/ in a package, else this tree's build.
-EXE = next((p for p in (BASE / "bin" / "valhalla.exe",
-                        BASE / "target-7900" / "x86_64-pc-windows-msvc" / "diag" / "valhalla.exe") if p.exists()),
-           BASE / "bin" / "valhalla.exe")
+def runtime_path(path: Path) -> Path:
+    path = path.expanduser().resolve()
+    if any((p / ".victory-root").is_file() for p in (path, *path.parents)):
+        raise ValueError(f"Runtime data cannot be stored in the source tree: {path}")
+    return path
+
+
+def location(override: str, xdg: str, default: Path) -> Path:
+    return runtime_path(Path(os.environ.get(override) or Path(os.environ.get(xdg) or default) / "valhalla"))
+
+
+STATE = location("VALHALLA_STATE_DIR", "XDG_STATE_HOME", Path.home() / ".local/state")
+CACHE = location("VALHALLA_CACHE_DIR", "XDG_CACHE_HOME", Path.home() / ".cache")
+DATA = location("VALHALLA_DATA_DIR", "XDG_DATA_HOME", Path.home() / ".local/share")
+SETTINGS_FILE = STATE / "launcher.json"
+LOG_FILE = STATE / "valhalla.log"
+
+
+def executable(diagnostics: bool) -> Path:
+    if override := os.environ.get("EXE"):
+        return Path(override).expanduser().resolve()
+    profile = "diag" if diagnostics else "release"
+    built = BASE.parent / "target" / "x86_64-pc-windows-msvc" / profile / "valhalla.exe"
+    packaged = BASE / "bin" / ("valhalla-diagnostics.exe" if diagnostics else "valhalla.exe")
+    return next((p for p in (built, packaged) if p.is_file()), built)
+
+
+def gpu_vendor() -> str:
+    vendors = set()
+    for path in Path("/sys/class/drm").glob("card*/device/vendor"):
+        try:
+            vendors.add(path.read_text().strip())
+        except OSError:
+            continue
+    return "nvidia" if "0x10de" in vendors else "amd" if "0x1002" in vendors else "other"
+
+
 GAME_EXE_NAME = os.environ.get("GAME_EXE", "game.exe")
 FIDELITYFX = BASE / "keep" / "fidelityfx"
-CAPTURES = BASE / "captures"
-SHADER_CACHE = BASE / "victory-data" / "cache-7900" / "shaders"
+CAPTURES = STATE / "captures"
+SHADER_CACHE = runtime_path(Path(os.environ.get("VICTORY_CACHE_DIR") or CACHE / "cache")) / "shaders"
 
 
 def shaders_prepared() -> bool:
@@ -48,15 +79,15 @@ def shaders_prepared() -> bool:
 def key_art(game_dir: Path) -> list[Path]:
     return [game_dir / "xbs_splash.png", game_dir / "xbs_logo_480.png"]
 
-RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160"]
+RESOLUTIONS = ["1280x720", "1664x936", "1920x1080", "2560x1440", "3840x2160"]
 # Name, render scale (of the output) for AMD FSR.
 FSR_QUALITY = [
     ("Native AA", 1.0),
     ("Quality", 0.6667),
     ("Balanced", 0.5882),
     ("Performance", 0.5),
-    ("Ultra Performance", 0.3333),
 ]
+RENDER_SCALES = [("Default", ""), ("50% (experimental)", "0.5"), ("67%", "0.6667"), ("100%", "1")]
 # Name, frame interval the title is paced at (ms): whole vblanks of 60 Hz, as
 # on the console. (16 ms ticks put 30 fps video on a 2-2-2-3 tick cadence:
 # Bink's logo video juddered, 2026-11-26.)
@@ -66,6 +97,9 @@ FRAME_CAPS = [("30 fps", "33.333"), ("60 fps", "16.667"), ("120 fps", "8.333"), 
 @dataclass
 class Settings:
     preset: str = "High"
+    vendor: str = "auto"
+    diagnostics: bool = True
+    render_scale: str = "Default"
     resolution: str = "2560x1440"
     upscaler: str = "fsr"  # "game": the title's own; "fsr": AMD FSR on the host
     fsr_quality: str = "Quality"
@@ -86,16 +120,21 @@ class Settings:
     game_dir: str = ""  # the game's folder (its own files); empty: game/ beside Valhalla
 
     def game_path(self) -> Path:
-        return Path(self.game_dir).expanduser() if self.game_dir else BASE / "game"
+        return Path(self.game_dir or os.environ.get("GAME_DIR") or DATA / "game").expanduser().resolve()
 
     @staticmethod
     def load() -> "Settings":
         try:
             data = json.loads(SETTINGS_FILE.read_text())
         except (OSError, ValueError):
-            return Settings()
+            return apply_preset(Settings(), "Performance" if gpu_vendor() == "nvidia" else "High")
+        if not isinstance(data, dict):
+            return apply_preset(Settings(), "Performance" if gpu_vendor() == "nvidia" else "High")
         known = {f.name for f in fields(Settings)}
-        return Settings(**{k: v for k, v in data.items() if k in known})
+        settings = Settings(**{k: v for k, v in data.items() if k in known})
+        if settings.resolution == "1600x900":
+            settings.resolution = "1664x936"
+        return settings
 
     def save(self) -> None:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +142,21 @@ class Settings:
 
 
 PRESETS: dict[str, dict] = {
+    "Compatibility": dict(resolution="1920x1080", upscaler="game", render_scale="Default", fsr4=False,
+                          frame_generation=False, frame_cap="60 fps", console="series-s", low_memory=False,
+                          ray_tracing=False, safe_mode=True, pipeline_wait_ms=500),
+    "Performance": dict(resolution="1920x1080", upscaler="game", render_scale="Default", fsr4=False,
+                        frame_generation=False, frame_cap="120 fps", console="series-s", low_memory=False,
+                        ray_tracing=False, safe_mode=False, pipeline_wait_ms=30),
+    "Balanced": dict(resolution="1920x1080", upscaler="game", render_scale="Default", fsr4=False,
+                     frame_generation=False, frame_cap="60 fps", console="series-x", low_memory=False,
+                     ray_tracing=False, safe_mode=False, pipeline_wait_ms=100),
+    "Quality": dict(resolution="2560x1440", upscaler="game", render_scale="67%", fsr4=False,
+                    frame_generation=False, frame_cap="60 fps", console="series-x", low_memory=False,
+                    ray_tracing=False, safe_mode=False, pipeline_wait_ms=100),
+    "Experimental": dict(resolution="1920x1080", upscaler="game", render_scale="50% (experimental)", fsr4=False,
+                         frame_generation=False, frame_cap="Unlimited", console="series-s", low_memory=False,
+                         ray_tracing=False, safe_mode=False, pipeline_wait_ms=30),
     # A lower-spec PC: the title's Series S settings, 1080p, FSR Performance,
     # frame generation for smoothness, 30 fps pacing. (Not low memory mode:
     # under Wine it made every window wait for card memory, 4-5 fps.)
@@ -144,18 +198,22 @@ def windows_path(p: Path) -> str:
 
 def launch_env(s: Settings) -> dict[str, str]:
     """The settings as run-7900.sh's environment."""
+    vendor = gpu_vendor() if s.vendor == "auto" else s.vendor
     env: dict[str, str] = {
         "LOG": str(LOG_FILE),
-        "EXE": str(EXE),
+        "EXE": str(executable(s.diagnostics)),
+        "VICTORY_DIAGNOSTICS": "1" if s.diagnostics else "0",
+        "VALHALLA_GPU_VENDOR": vendor,
         "VICTORY_OUTPUT": s.resolution,
         "VICTORY_FRAME_INTERVAL_MS": dict(FRAME_CAPS).get(s.frame_cap, "16.667"),
         "VICTORY_AMBIENT": f"{s.ambient:g}",
         "VICTORY_AMBIENT_REFLECT": "1" if s.reflections_hold else "0",
         "VICTORY_PIPELINE_WAIT_MS": str(int(s.pipeline_wait_ms)),
-        "VICTORY_PANEL": "1" if s.stats_overlay else "0",
+        "VICTORY_PANEL": "1" if s.stats_overlay and s.diagnostics else "0",
         "SKIP_INTRO": "1" if s.skip_intro else "0",
         "VICTORY_CARD_BUFFERS_MIN_KB": "64",
         "GAME_DIR": str(s.game_path()),
+        "GAME_EXE": GAME_EXE_NAME,
     }
     if s.console == "series-s":
         env["CONSOLE"] = "series-s"
@@ -163,21 +221,37 @@ def launch_env(s: Settings) -> dict[str, str]:
         env["VICTORY_FIDELITYFX_DIR"] = windows_path(FIDELITYFX)
         env["VICTORY_UPSCALER"] = "7"
         env["VICTORY_FFX_SCALE"] = f"{dict(FSR_QUALITY).get(s.fsr_quality, 0.6667):g}"
-        if s.fsr4:
+        if s.fsr4 and vendor == "amd":
             env["FSR4_UPGRADE"] = "1"
             env["PROTON_FSR4_UPGRADE"] = "1"
-        if s.frame_generation:
+        if s.frame_generation and s.diagnostics:
             env["VICTORY_FIDELITYFX_FRAMEGEN"] = "1"
+    elif scale := dict(RENDER_SCALES).get(s.render_scale):
+        env["VICTORY_RENDER_SCALE"] = scale
     if s.ray_tracing:
         env["RT"] = "1"
     if s.safe_mode:
         env["SAFE"] = "1"
+        env.update({k: "0" for k in ("VICTORY_TEXTURE_NO_WAIT", "VICTORY_THIN", "VICTORY_UPLOAD_AHEAD",
+                                        "VICTORY_PORT_DESCRIPTORS", "VICTORY_PORT_CONSTANTS", "VICTORY_PORT_PRIVATE",
+                                        "VICTORY_PORT_CBV")})
+    if s.preset == "Experimental":
+        env["VICTORY_SHADER_OPT"] = "127"  # opt-in vectorized raw loads; needs NVIDIA A/B
     if s.low_memory:
         env["VICTORY_WINDOW_PLAIN"] = "1"
-    if s.f4_capture:
-        CAPTURES.mkdir(parents=True, exist_ok=True)
+    if s.f4_capture and s.diagnostics:
         env["VICTORY_CAPTURE"] = str(CAPTURES)
         env["VICTORY_DUMP_TARGETS"] = "1"
+    return env
+
+
+def process_env(s: Settings) -> dict[str, str]:
+    env = dict(os.environ)
+    # Switching profiles must clear settings inherited from an earlier preset.
+    for key in ("FSR4_UPGRADE", "PROTON_FSR4_UPGRADE", "VICTORY_FIDELITYFX_FRAMEGEN", "VICTORY_UPSCALER",
+                "VICTORY_FFX_SCALE", "VICTORY_RENDER_SCALE", "VICTORY_FIDELITYFX_DIR", "SAFE", "RT", "CONSOLE"):
+        env.pop(key, None)
+    env.update(launch_env(s))
     return env
 
 
@@ -192,7 +266,7 @@ def game_pids() -> list[int]:
             args = (proc / "cmdline").read_bytes().replace(b"\0", b" ")
         except OSError:
             continue
-        if comm == "main" and b"valhalla.exe" in args and b" run" in args:
+        if comm == "main" and (b"valhalla.exe" in args or b"valhalla-diagnostics.exe" in args) and b" run" in args:
             out.append(int(proc.name))
     return out
 
@@ -213,7 +287,7 @@ def last_fps() -> str | None:
     return f"{float(fps):.1f} fps real · {float(ms):.1f} ms a frame · {draws} draws"
 
 
-def system_info(game_dir: Path | None = None) -> list[tuple[str, str, bool]]:
+def system_info(game_dir: Path | None = None, settings: Settings | None = None) -> list[tuple[str, str, bool]]:
     """(what, found, all right) for the system check."""
     rows = []
     cpu = "?"
@@ -240,18 +314,23 @@ def system_info(game_dir: Path | None = None) -> list[tuple[str, str, bool]]:
             for line in out.splitlines():
                 if re.search(r"VGA|3D controller|Display controller", line):
                     gpu = line.split(": ", 1)[-1]
-                    if "AMD" in gpu or "ATI" in gpu:
+                    if "NVIDIA" in gpu or "AMD" in gpu or "ATI" in gpu:
                         break
         except (OSError, subprocess.SubprocessError):
             pass
     rows.append(("Graphics card", gpu, gpu != "?"))
-    rows.append(("Proton", "found" if (BASE / "proton-patched" / "files" / "bin" / "wine").exists() else "missing",
-                 (BASE / "proton-patched" / "files" / "bin" / "wine").exists()))
-    game = (game_dir or Settings.load().game_path()) / GAME_EXE_NAME
+    try:
+        proton = subprocess.run(["bash", str(BASE / "run-victory.sh"), "--print-proton"], capture_output=True, text=True, timeout=5)
+        rows.append(("Proton", proton.stdout.strip() or "missing", proton.returncode == 0))
+    except (OSError, subprocess.SubprocessError):
+        rows.append(("Proton", "missing", False))
+    settings = settings or Settings.load()
+    game = (game_dir or settings.game_path()) / GAME_EXE_NAME
     rows.append(("Game files", str(game.parent) if game.exists() else f"missing in {game.parent}", game.exists()))
-    rows.append(("Valhalla build", "found" if EXE.exists() else "missing (build it first)", EXE.exists()))
+    exe = executable(settings.diagnostics)
+    rows.append(("Valhalla build", "found" if exe.exists() else "missing (build it first)", exe.exists()))
     fsr = (FIDELITYFX / "amd_fidelityfx_upscaler_dx12.dll").exists()
-    rows.append(("AMD FidelityFX", "found" if fsr else "missing (FSR off)", fsr))
+    rows.append(("AMD FidelityFX", "found" if fsr else "missing (FSR off)", fsr or settings.upscaler != "fsr"))
     rows.append(("Launch script", "found" if (BASE / "run-7900.sh").exists() else "missing", (BASE / "run-7900.sh").exists()))
     return rows
 
@@ -597,17 +676,10 @@ def run_window() -> int:
             v.addStretch(1)
             presets = QHBoxLayout()
             presets.setSpacing(0)
-            self.preset_buttons = QButtonGroup(self)
-            names = ["Low", "Medium", "High", "Ultra", "S70", "Custom"]
-            for i, name in enumerate(names):
-                b = QPushButton(name.upper())
-                b.setObjectName("segfirst" if i == 0 else "seglast" if i == len(names) - 1 else "seg")
-                b.setCheckable(True)
-                b.setCursor(Qt.PointingHandCursor)
-                b.setProperty("preset", name)
-                b.clicked.connect(lambda _=False, n=name: self.choose_preset(n))
-                self.preset_buttons.addButton(b)
-                presets.addWidget(b)
+            self.preset = QComboBox()
+            self.preset.addItems([*PRESETS, "Custom"])
+            self.preset.activated.connect(lambda _: self.choose_preset(self.preset.currentText()))
+            presets.addWidget(self.preset)
             presets.addStretch(1)
             v.addWidget(label("PRESET", "group"))
             v.addLayout(presets)
@@ -641,8 +713,12 @@ def run_window() -> int:
             self.stack.addWidget(hero)
 
         def build_graphics(self) -> None:
-            area, v = page("Graphics", "Picture and AMD FidelityFX. Changes apply the next time the game starts.")
+            area, v = page("Graphics", "Resolution, upscaling and GPU settings. Changes apply on the next launch.")
             rows = group(v, "Display")
+            self.vendor = QComboBox()
+            for name, value in [("Automatic", "auto"), ("NVIDIA", "nvidia"), ("AMD", "amd"), ("Other", "other")]:
+                self.vendor.addItem(name, value)
+            rows.add("GPU vendor", "FSR 4 upgrades are only requested for AMD. Other vendors can use the game's upscaler.", self.vendor)
             self.resolution = QComboBox()
             self.resolution.addItems(RESOLUTIONS)
             rows.add("Output resolution", "The size the game renders its frame for.", self.resolution)
@@ -654,6 +730,9 @@ def run_window() -> int:
             self.upscaler.addItem("AMD FSR", "fsr")
             self.upscaler.addItem("The game's own", "game")
             rows.add("Upscaler", "AMD FSR on the PC, or the game's own upscaling.", self.upscaler)
+            self.render_scale = QComboBox()
+            self.render_scale.addItems([name for name, _ in RENDER_SCALES])
+            rows.add("Game render scale", "Internal scale for the game's own upscaler. 50% is experimental.", self.render_scale)
             self.fsr_quality = QComboBox()
             for name, scale in FSR_QUALITY:
                 self.fsr_quality.addItem(f"{name} ({scale * 100:.0f}%)", name)
@@ -711,6 +790,8 @@ def run_window() -> int:
             rows.add("Pipeline wait", "How long a frame waits for a pipeline still being built. "
                      "Higher: fewer pop-ins, more stutter.", self.pipeline_wait)
             rows = group(v, "While playing")
+            self.diagnostics = Toggle()
+            rows.add("Diagnostics build", "Enables profiling, the overlay, captures and FidelityFX frame generation. Disable for normal builds.", self.diagnostics)
             self.stats_overlay = Toggle()
             rows.add("Stats overlay", "Real and final fps and the frame's parts. F3 shows and hides it.",
                      self.stats_overlay)
@@ -779,10 +860,10 @@ def run_window() -> int:
         # Settings <-> widgets.
         def toggles(self) -> list:
             return [self.fsr4, self.frame_generation, self.reflections_hold, self.ray_tracing, self.safe_mode,
-                    self.low_memory, self.stats_overlay, self.skip_intro, self.f4_capture, self.hw_log]
+                    self.low_memory, self.stats_overlay, self.skip_intro, self.f4_capture, self.hw_log, self.diagnostics]
 
         def connect_changes(self) -> None:
-            for w in (self.resolution, self.frame_cap, self.upscaler, self.fsr_quality):
+            for w in (self.resolution, self.frame_cap, self.upscaler, self.fsr_quality, self.vendor, self.render_scale):
                 w.currentIndexChanged.connect(self.changed)
             for w in self.toggles() + [self.series_x, self.series_s]:
                 w.toggled.connect(self.changed)
@@ -798,6 +879,9 @@ def run_window() -> int:
             self.reflections_hold.setChecked(s.reflections_hold)
             self.ray_tracing.setChecked(s.ray_tracing)
             self.upscaler.setCurrentIndex(max(0, self.upscaler.findData(s.upscaler)))
+            self.vendor.setCurrentIndex(max(0, self.vendor.findData(s.vendor)))
+            self.render_scale.setCurrentText(s.render_scale)
+            self.diagnostics.setChecked(s.diagnostics)
             self.fsr_quality.setCurrentIndex(max(0, self.fsr_quality.findData(s.fsr_quality)))
             self.fsr4.setChecked(s.fsr4)
             self.frame_generation.setChecked(s.frame_generation)
@@ -809,8 +893,7 @@ def run_window() -> int:
             self.skip_intro.setChecked(s.skip_intro)
             self.f4_capture.setChecked(s.f4_capture)
             self.hw_log.setChecked(s.hw_log)
-            for b in self.preset_buttons.buttons():
-                b.setChecked(b.property("preset") == s.preset)
+            self.preset.setCurrentText(s.preset)
             self.refresh()
             self.loading = False
 
@@ -822,6 +905,9 @@ def run_window() -> int:
             s.reflections_hold = self.reflections_hold.isChecked()
             s.ray_tracing = self.ray_tracing.isChecked()
             s.upscaler = self.upscaler.currentData()
+            s.vendor = self.vendor.currentData()
+            s.render_scale = self.render_scale.currentText()
+            s.diagnostics = self.diagnostics.isChecked()
             s.fsr_quality = self.fsr_quality.currentData()
             s.fsr4 = self.fsr4.isChecked()
             s.frame_generation = self.frame_generation.isChecked()
@@ -837,16 +923,21 @@ def run_window() -> int:
         def refresh(self) -> None:
             s = self.s
             fsr = self.upscaler.currentData() == "fsr" and (FIDELITYFX / "amd_fidelityfx_upscaler_dx12.dll").exists()
-            for w in (self.fsr_quality, self.fsr4, self.frame_generation):
-                w.setEnabled(fsr)
+            vendor = gpu_vendor() if s.vendor == "auto" else s.vendor
+            self.fsr_quality.setEnabled(fsr)
+            self.fsr4.setEnabled(fsr and vendor == "amd")
+            self.frame_generation.setEnabled(fsr and s.diagnostics)
+            self.render_scale.setEnabled(s.upscaler == "game")
+            self.stats_overlay.setEnabled(s.diagnostics)
+            self.f4_capture.setEnabled(s.diagnostics)
             self.ambient_label.setText(f"{self.ambient.value() / 100:.2f}")
-            up = f"FSR {'4' if s.fsr4 else '3.1'} {s.fsr_quality}" if s.upscaler == "fsr" else "GAME UPSCALER"
+            up = f"FSR {'4' if s.fsr4 and vendor == 'amd' else '3.1'} {s.fsr_quality}" if s.upscaler == "fsr" else "GAME UPSCALER"
             chips = [s.resolution, up.upper(),
-                     "FRAME GENERATION" if s.upscaler == "fsr" and s.frame_generation else "NO FRAME GENERATION",
+                     "FRAME GENERATION" if s.upscaler == "fsr" and s.frame_generation and s.diagnostics else "NO FRAME GENERATION",
                      "SERIES S" if s.console == "series-s" else "SERIES X", s.frame_cap.upper()]
             for c, text in zip(self.chip_labels, chips):
                 c.setText(text)
-            bad = [what for what, _, ok in system_info() if not ok]
+            bad = [what for what, _, ok in system_info(settings=s) if not ok]
             self.checks_line.setText("Everything Valhalla needs is in place." if not bad
                                      else "Missing: " + ", ".join(bad) + "  (see System)")
             for w in self.toggles():
@@ -860,8 +951,7 @@ def run_window() -> int:
                 getattr(self.s, k) != v for k, v in PRESETS.get(self.s.preset, {}).items()
             ):
                 self.s.preset = "Custom"
-                for b in self.preset_buttons.buttons():
-                    b.setChecked(b.property("preset") == "Custom")
+                self.preset.setCurrentText("Custom")
             self.refresh()
             self.s.save()
             self.tick()
@@ -877,7 +967,7 @@ def run_window() -> int:
             if game_pids():
                 QMessageBox.information(self, "Valhalla", "The game is running already.")
                 return
-            missing = [what for what, _, ok in system_info() if not ok and what in
+            missing = [what for what, _, ok in system_info(settings=self.s) if not ok and what in
                        ("Proton", "Game files", "Valhalla build", "Launch script")]
             if missing:
                 QMessageBox.warning(self, "Valhalla", "Missing: " + ", ".join(missing))
@@ -894,8 +984,7 @@ def run_window() -> int:
                 self.nav.button(4).setChecked(True)
                 self.prepare()
                 return
-            env = dict(os.environ)
-            env.update(launch_env(self.s))
+            env = process_env(self.s)
             if not self.s.hw_log:
                 env["NO_HW_LOG"] = "1"
             self.game = subprocess.Popen(["bash", str(BASE / "run-7900.sh")], cwd=BASE, env=env,
@@ -940,9 +1029,9 @@ def run_window() -> int:
             self.console_out.clear()
             steps = [["bash", str(BASE / "run-victory.sh"), "shaders", str(self.s.game_path())],
                      ["bash", str(BASE / "run-victory.sh"), "warm", "--used"]]
-            env = dict(os.environ)
-            env.update({"VICTORY_EXE": str(EXE), "VICTORY_CACHE_DIR": str(BASE / "victory-data" / "cache-7900"),
-                        "VICTORY_PIPELINE_BOOK": "1", "VICTORY_PORT_CBV": "1"})
+            env = process_env(self.s)
+            env.update({"VICTORY_EXE": str(executable(self.s.diagnostics)), "VICTORY_PIPELINE_BOOK": "1"})
+            env.setdefault("VICTORY_PORT_CBV", "1")
             self.prepare_button.setEnabled(False)
             self.prepare_button.setText("Preparing…")
             self.run_steps(steps, env)
@@ -961,7 +1050,8 @@ def run_window() -> int:
                         QMessageBox.warning(self, "Valhalla", "The shaders were not prepared: see Tools.")
                 return
             proc = QProcess(self)
-            proc.setWorkingDirectory(str(BASE))
+            STATE.mkdir(parents=True, exist_ok=True)
+            proc.setWorkingDirectory(str(STATE))
             penv = QProcessEnvironment()
             for k, v in env.items():
                 penv.insert(k, v)
@@ -970,7 +1060,16 @@ def run_window() -> int:
             proc.readyReadStandardOutput.connect(
                 lambda: self.console_out.appendPlainText(
                     re.sub(r"\x1b\[[0-9;]*m", "", bytes(proc.readAllStandardOutput()).decode(errors="replace")).rstrip()))
-            proc.finished.connect(lambda *_: self.run_steps(steps[1:], env))
+            def finished(code, status):
+                if code == 0 and status == QProcess.NormalExit:
+                    self.run_steps(steps[1:], env)
+                else:
+                    self.tool = None
+                    self.play_after_prepare = False
+                    self.prepare_button.setEnabled(True)
+                    self.prepare_button.setText("Prepare")
+                    self.console_out.appendPlainText(f"\nPreparation failed (exit {code}).")
+            proc.finished.connect(finished)
             self.console_out.appendPlainText("$ " + " ".join(steps[0][1:]))
             self.tool = proc
             proc.start(steps[0][0], steps[0][1:])
@@ -1003,7 +1102,7 @@ def run_window() -> int:
 
 def selftest() -> int:
     """The presets and settings give the environments the runs were tested with."""
-    s = apply_preset(Settings(), "High")
+    s = apply_preset(Settings(vendor="amd"), "High")
     env = launch_env(s)
     assert env["VICTORY_OUTPUT"] == "2560x1440" and env["VICTORY_UPSCALER"] == "7", env
     assert env["VICTORY_FFX_SCALE"] == "0.6667" and env["VICTORY_FIDELITYFX_FRAMEGEN"] == "1", env
@@ -1018,13 +1117,23 @@ def selftest() -> int:
     s2 = apply_preset(Settings(), "Medium")
     assert s2.preset == "Medium" and apply_preset(s2, "nope").preset == "Custom"
     assert windows_path(Path("/a/b")) == "Z:\\a\\b"
-    s70 = launch_env(apply_preset(Settings(low_memory=True, console="series-s"), "S70"))
+    s70 = launch_env(apply_preset(Settings(vendor="amd", low_memory=True, console="series-s"), "S70"))
     assert s70["VICTORY_OUTPUT"] == "2560x1440" and s70["VICTORY_FFX_SCALE"] == "0.6667", s70
     assert s70["FSR4_UPGRADE"] == "1" and s70["VICTORY_FIDELITYFX_FRAMEGEN"] == "1", s70
     assert s70["VICTORY_FRAME_INTERVAL_MS"] == "16.667" and "CONSOLE" not in s70 and "VICTORY_WINDOW_PLAIN" not in s70, s70
+    nvidia = launch_env(apply_preset(Settings(vendor="nvidia"), "Performance"))
+    assert nvidia["CONSOLE"] == "series-s" and nvidia["VICTORY_FRAME_INTERVAL_MS"] == "8.333"
+    assert not {"FSR4_UPGRADE", "PROTON_FSR4_UPGRADE", "VICTORY_FIDELITYFX_FRAMEGEN"} & nvidia.keys()
+    nvidia_fsr = launch_env(apply_preset(Settings(vendor="nvidia"), "High"))
+    assert "FSR4_UPGRADE" not in nvidia_fsr and "PROTON_FSR4_UPGRADE" not in nvidia_fsr
+    assert launch_env(Settings(diagnostics=False))["VICTORY_PANEL"] == "0"
+    assert "VICTORY_FIDELITYFX_FRAMEGEN" not in launch_env(Settings(diagnostics=False))
+    assert launch_env(apply_preset(Settings(), "Experimental"))["VICTORY_SHADER_OPT"] == "127"
+    assert launch_env(apply_preset(Settings(), "Compatibility"))["VICTORY_TEXTURE_NO_WAIT"] == "0"
+    assert all(BASE.parent not in p.parents for p in (SETTINGS_FILE, LOG_FILE, SHADER_CACHE, CAPTURES))
     # Every variable any setting sets is read: by the runtime's sources, the
     # launch scripts, or Proton (the FSR 4 upgrade).
-    every = Settings(upscaler="fsr", fsr4=True, frame_generation=True, console="series-s", ray_tracing=True,
+    every = Settings(vendor="amd", upscaler="fsr", fsr4=True, frame_generation=True, console="series-s", ray_tracing=True,
                      safe_mode=True, low_memory=True, f4_capture=False, stats_overlay=False, skip_intro=False)
     names = set(launch_env(every)) | {"NO_HW_LOG", "VICTORY_CAPTURE", "VICTORY_DUMP_TARGETS"}
     sources = [BASE / "run-7900.sh", BASE / "run-victory.sh"] + list((BASE / "victory7900" / "crates").rglob("*.rs")) \
