@@ -268,7 +268,11 @@ extern "system" fn check_feature_support(
     data: *mut c_void,
     size: u32,
 ) -> HRESULT {
-    feature_support(feature, data, size, crate::external::host_fidelityfx_enabled())
+    #[cfg(windows)]
+    let host_fidelityfx = crate::external::host_fidelityfx_enabled();
+    #[cfg(not(windows))]
+    let host_fidelityfx = false;
+    feature_support(feature, data, size, host_fidelityfx)
 }
 
 fn feature_support(feature: u32, data: *mut c_void, size: u32, host_fidelityfx: bool) -> HRESULT {
