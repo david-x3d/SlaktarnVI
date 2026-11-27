@@ -44,6 +44,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+mod perf_frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(all(windows, feature = "diagnostics"))]

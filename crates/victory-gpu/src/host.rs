@@ -9402,6 +9402,8 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
 }
 
 struct Meter {
+    #[cfg(feature = "diagnostics")]
+    profile: Option<crate::perf_frame::Recorder>,
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
@@ -9417,6 +9419,8 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            #[cfg(feature = "diagnostics")]
+            profile: crate::perf_frame::Recorder::from_env(),
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
@@ -10144,6 +10148,14 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
+            }
+            #[cfg(feature = "diagnostics")]
+            if status == windows::Win32::Foundation::S_OK {
+                if let Some(recorder) = &mut p.meter.profile {
+                    let count = p.swap_chain.GetLastPresentCount().ok();
+                    let (hits, misses) = crate::shader_cache::counts();
+                    recorder.present(frame as u64, count, crate::draw::drawn(), hits, misses);
+                }
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
