@@ -525,6 +525,74 @@ impl Module {
                     };
                     return Some(self.k(ty, bits, r));
                 }
+                // Lane masks, packed VGPR fields and address calculations often
+                // apply multiple constant masks or shifts. Contract only integer
+                // operations and only shifts whose individual counts are valid.
+                // The inner instruction stays available for any other users.
+                if matches!(op, Bin::And | Bin::Or | Bin::Xor) {
+                    let outer = kb.map(|k| (a, k)).or_else(|| ka.map(|k| (b, k)));
+                    if let Some((V::Inst(j), k)) = outer
+                        && let Op::Bin(inner, x, y) = self.insts[j as usize].op
+                    {
+                        if inner == op {
+                            let inner = self
+                                .int_k(y)
+                                .map(|(_, k)| (x, k))
+                                .or_else(|| self.int_k(x).map(|(_, k)| (y, k)));
+                            if let Some((v, c)) = inner {
+                                let combined = match op {
+                                    Bin::And => c & k,
+                                    Bin::Or => c | k,
+                                    Bin::Xor => c ^ k,
+                                    _ => unreachable!(),
+                                };
+                                if combined == c {
+                                    return Some(V::Inst(j));
+                                }
+                                let c = self.k(ty, bits, combined);
+                                self.insts[i as usize].op = Op::Bin(op, v, c);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                        // A logical right shift already clears its top bits;
+                        // a zero extension likewise clears everything above
+                        // the original width (handled below).
+                        if op == Bin::And
+                            && inner == Bin::LShr
+                            && let Some((_, shift)) = self.int_k(y)
+                            && shift < u64::from(bits)
+                            && (all >> shift) & !k == 0
+                        {
+                            return Some(V::Inst(j));
+                        }
+                    }
+                    if op == Bin::And
+                        && let Some((V::Inst(j), k)) = outer
+                        && let Op::Cast(Cast::ZExt, x) = self.insts[j as usize].op
+                        && let Some(from) = self.int_bits(self.type_of(x))
+                        && mask(from) & !k == 0
+                    {
+                        return Some(V::Inst(j));
+                    }
+                }
+                if matches!(op, Bin::Shl | Bin::LShr | Bin::AShr)
+                    && let (V::Inst(j), Some(outer)) = (a, kb)
+                    && outer < u64::from(bits)
+                    && let Op::Bin(inner, x, y) = self.insts[j as usize].op
+                    && inner == op
+                    && let Some((_, inner)) = self.int_k(y)
+                    && inner < u64::from(bits)
+                {
+                    let total = outer + inner;
+                    if total >= u64::from(bits) && op != Bin::AShr {
+                        return Some(self.k(ty, bits, 0));
+                    }
+                    let shift = self.k(ty, bits, total.min(u64::from(bits - 1)));
+                    self.insts[i as usize].op = Op::Bin(op, x, shift);
+                    *changed = true;
+                    return None;
+                }
                 match (op, ka, kb) {
                     (
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
@@ -1401,6 +1469,117 @@ mod tests {
         let stores = stores(&m, b);
         assert_eq!(stores, [vec![x, four], vec![minus4, wide]]);
         m.write();
+    }
+
+    #[test]
+    fn constant_mask_and_shift_chains_contract() {
+        let Kit {
+            mut m, b, writes, ..
+        } = kit();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let input = m.function("dx.op.loadInput.i32", fty, Some(Attr::ReadOnly), false);
+        let zero = m.i32(0);
+        let one = m.i32(1);
+        let x = m.call(b, input, vec![zero, zero]);
+        let y = m.call(b, input, vec![zero, one]);
+        for bits in [32, 64] {
+            let ty = m.int(bits);
+            let v = if bits == 32 {
+                x
+            } else {
+                let lo = m.cast(b, Cast::ZExt, x, ty);
+                let hi = m.cast(b, Cast::ZExt, y, ty);
+                let n = m.k(ty, bits, 32);
+                let hi = m.bin(b, Bin::Shl, hi, n);
+                m.bin(b, Bin::Or, hi, lo)
+            };
+            let a = m.k(ty, bits, 0xA5A5_A5A5_A5A5_A5A5);
+            let c = m.k(ty, bits, 0xCC33_CC33_CC33_CC33);
+            let small = m.k(ty, bits, 3);
+            let large = m.k(ty, bits, u64::from(bits - 2));
+            let mut results = Vec::new();
+            for op in [Bin::And, Bin::Or, Bin::Xor] {
+                let first = m.bin(b, op, a, v);
+                results.push(m.bin(b, op, first, c));
+            }
+            for op in [Bin::Shl, Bin::LShr, Bin::AShr] {
+                let first = m.bin(b, op, v, small);
+                results.push(m.bin(b, op, first, small));
+                results.push(m.bin(b, op, first, large));
+            }
+            let shr = m.bin(b, Bin::LShr, v, small);
+            let top_clear = m.k(ty, bits, mask(bits) >> 3);
+            results.push(m.bin(b, Bin::And, shr, top_clear));
+            let partial_mask = m.k(ty, bits, 0xF);
+            results.push(m.bin(b, Bin::And, shr, partial_mask));
+            for result in results {
+                if bits == 64 {
+                    let n = m.k(ty, bits, 32);
+                    let high = m.bin(b, Bin::LShr, result, n);
+                    let lo = m.cast(b, Cast::Trunc, result, i32t);
+                    let hi = m.cast(b, Cast::Trunc, high, i32t);
+                    m.call(b, writes, vec![lo, hi]);
+                } else {
+                    m.call(b, writes, vec![result, zero]);
+                }
+            }
+        }
+        let i16t = m.int(16);
+        let narrow = m.cast(b, Cast::Trunc, x, i16t);
+        let wide = m.cast(b, Cast::ZExt, narrow, i32t);
+        let full = m.i32(0xFFFF);
+        let partial = m.i32(0x7FFF);
+        let same = m.bin(b, Bin::And, wide, full);
+        let different = m.bin(b, Bin::And, wide, partial);
+        m.call(b, writes, vec![same, different]);
+        m.terminate(b, Term::Ret);
+        let inputs = [
+            [0, 0],
+            [u32::MAX, u32::MAX],
+            [0x8000_8000, 0x8000_0000],
+            [0x1234_5678, 0x9ABC_DEF0],
+            [1, 0x7FFF_FFFF],
+        ];
+        let before: Vec<_> = inputs.iter().map(|input| run(&m, input)).collect();
+        let size = body(&m, b);
+        m.optimise(FOLD | DEAD);
+        assert!(
+            body(&m, b) + 12 <= size,
+            "expected contractions: {} -> {}",
+            size,
+            body(&m, b)
+        );
+        for (input, expected) in inputs.iter().zip(before) {
+            assert_eq!(run(&m, input), expected, "input {input:x?}");
+        }
+        assert_eq!(stores(&m, b).last().unwrap()[0], wide);
+        assert_eq!(stores(&m, b).last().unwrap()[1], different);
+        m.write();
+    }
+
+    #[test]
+    fn invalid_shift_counts_are_not_contracted() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let one = m.i32(1);
+        let too_large = m.i32(32);
+        let x = m.call(b, reads, vec![one, one]);
+        let invalid = m.bin(b, Bin::LShr, x, too_large);
+        let chain = m.bin(b, Bin::LShr, invalid, one);
+        m.call(b, writes, vec![chain, one]);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | DEAD);
+        assert_eq!(body(&m, b), 4);
+        assert!(
+            matches!(m.insts[match chain { V::Inst(i) => i, _ => panic!() } as usize].op,
+            Op::Bin(Bin::LShr, a, c) if a == invalid && c == one)
+        );
     }
 
     #[test]
