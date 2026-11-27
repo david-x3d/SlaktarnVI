@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,6 +45,7 @@ def report(path, warmup=0):
             return None
     presents = sum_field("swapchain_present_delta")
     hits, misses = sum_field("shader_hit_delta"), sum_field("shader_miss_delta")
+    loaded, made = sum_field("pipeline_load_delta"), sum_field("pipeline_make_delta")
     return {
         "accepted_native_fps": len(rows) / total,
         "swapchain_present_rate": presents / total if presents is not None else None,
@@ -52,10 +54,53 @@ def report(path, warmup=0):
         "frame_ms": {"median": (intervals[(len(intervals)-1)//2] + intervals[len(intervals)//2])/2,
                      "p95": percentile(.95), "p99": percentile(.99)},
         "draw_counter_delta": sum_field("draw_delta"),
+        "dispatch_counter_delta": sum_field("dispatch_delta"),
+        "dropped_work_delta": sum_field("dropped_work_delta"),
+        "pipeline_library_loads": loaded,
+        "pipeline_make_counter": made,
+        "pipeline_library_load_fraction": loaded / (loaded + made) if loaded is not None and made is not None and loaded + made else None,
         "shader_cache_hits": hits, "shader_cache_misses": misses,
         "shader_cache_hit_rate": hits / (hits + misses) if hits is not None and misses is not None and hits + misses else None,
     }
 
+
+# These are upstream periodic samples, not time-aligned to the frame CSV.
+# Preserve the original aggregate values; never treat them as GPU timestamps.
+LOG_SAMPLE = re.compile(
+    r"(?P<native_fps>[\d.]+) fps, (?P<frame_ms>[\d.]+) ms/frame "
+    r"\((?P<cpu_prepare_ms>[\d.]+) preparing: copies (?P<copy_ms>[\d.]+) ms "
+    r"(?P<copy_mb>[\d.]+) MB, textures (?P<texture_ms>[\d.]+) ms "
+    r"(?P<texture_mb>[\d.]+) MB; (?P<gpu_wait_ms>[\d.]+) (?:on the|waiting for the) "
+    r"GPU; (?P<copyback_ms>[\d.]+) copying back (?P<copyback_mb>[\d.]+) MB\), "
+    r"(?P<draws>[\d.]+) draws/frame, dropped (?P<dropped>[\d.]+)")
+
+
+def log_samples(path):
+    samples, reasons = [], []
+    with open(path, errors="replace") as file:
+        for line in file:
+            if match := LOG_SAMPLE.search(line):
+                samples.append({k: float(v) for k, v in match.groupdict().items()})
+            if match := re.search(r"dropped ([\d.]+)/frame without a host pipeline: (.*)", line):
+                reasons.append({"per_frame": float(match[1]), "reason": match[2].strip()})
+    return {"periodic_frame_samples": samples, "periodic_drop_reasons": reasons}
+
+
+def hardware_summary(path):
+    with open(path, newline="") as file:
+        rows = list(csv.DictReader(file, delimiter="\t"))
+    result = {"samples": len(rows)}
+    for key in ("gpu%", "vram_MiB", "gpu_W", "cpu%", "game%", "ram_used_MiB"):
+        values = []
+        for row in rows:
+            try:
+                value = float(row[key])
+                if math.isfinite(value):
+                    values.append(value)
+            except (KeyError, ValueError, TypeError):
+                continue
+        result[key] = {"mean": sum(values) / len(values), "max": max(values)} if values else None
+    return result
 
 def run(args):
     root = external(args.output) if args.output else external(Path(
@@ -84,6 +129,10 @@ def run(args):
         except (ValueError, OSError) as exc:
             stats = {"error": str(exc)}
         stats["launcher_exit"] = result.returncode
+        if (directory / "run.log").is_file():
+            stats["runtime_log"] = log_samples(directory / "run.log")
+        if (directory / "run-hw.tsv").is_file():
+            stats["hardware_all_samples"] = hardware_summary(directory / "run-hw.tsv")
         (directory / "report.json").write_text(json.dumps(stats, indent=2) + "\n")
         print(name, json.dumps(stats, indent=2))
         if result.returncode not in (0, 124) or "error" in stats:
@@ -104,6 +153,14 @@ def selftest():
         assert stats["swapchain_present_rate"] is None
         assert stats["shader_cache_hit_rate"] == 4 / 6
         assert report(path, .01)["intervals"] == 2
+        assert stats["pipeline_library_load_fraction"] is None
+        log = Path(tmp) / "run.log"
+        log.write_text("10.0 fps, 100.0 ms/frame (2.0 preparing: copies 1.0 ms 2.0 MB, textures 3.0 ms 4.0 MB; 20.0 waiting for the GPU; 1.0 copying back 0.5 MB), 25 draws/frame, dropped 4\n")
+        assert log_samples(log)["periodic_frame_samples"][0]["gpu_wait_ms"] == 20
+        hw = Path(tmp) / "hw.tsv"
+        hw.write_text("gpu%\tvram_MiB\n50\t1000\n?\t2000\n")
+        assert hardware_summary(hw)["vram_MiB"] == {"mean": 1500, "max": 2000}
+        assert hardware_summary(hw)["gpu%"]["mean"] == 50
     print("benchmark selftest ok")
 
 
@@ -113,6 +170,8 @@ def main():
     reader = sub.add_parser("report")
     reader.add_argument("csv", type=Path)
     reader.add_argument("--warmup", type=float, default=0)
+    reader.add_argument("--log", type=Path)
+    reader.add_argument("--hardware", type=Path)
     runner = sub.add_parser("run")
     runner.add_argument("--output", type=Path)
     runner.add_argument("--duration", type=int, default=120)
@@ -124,7 +183,12 @@ def main():
     if args.command == "selftest":
         selftest()
     elif args.command == "report":
-        print(json.dumps(report(args.csv, args.warmup), indent=2))
+        stats = report(args.csv, args.warmup)
+        if args.log:
+            stats["runtime_log"] = log_samples(args.log)
+        if args.hardware:
+            stats["hardware_all_samples"] = hardware_summary(args.hardware)
+        print(json.dumps(stats, indent=2))
     else:
         if not 0 <= args.warmup < args.duration:
             parser.error("require 0 <= warmup < duration")

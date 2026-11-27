@@ -1100,6 +1100,19 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn count_dropped() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dropped_total() -> u64 {
+    DROPPED_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -3188,13 +3201,13 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3207,7 +3220,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3220,7 +3233,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3775,7 +3788,7 @@ impl State {
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4346,7 +4359,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4451,7 +4464,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }

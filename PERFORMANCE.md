@@ -26,7 +26,8 @@ accepted native presents separately.
 | Descriptor texture queue | A single traversal collects due slots and census; retries that fill the batch avoid fresh sort. Based on Vice-Tay 369f940ce283 (timorjay, PR #248). | Less CPU work and time holding queue mutex. Original ordering retained. |
 | Capped descriptor mirroring | Clip consumed write-watch ranges to mirrored host capacity, including marked/fallback port ranges. | Avoids reads and page jobs for unbacked NVIDIA slots; no changes to dynamic slot ownership. Does not fix all descriptors outside the cap. |
 | Content-addressed shader cache | Identical segmented hash keys, eight concurrent requests result in one conversion, all nine cache tests pass. | Removes per-request container copy, reduces duplicate compilation on misses sharing a cache instance. 256 lock stripes bound memory. Collisions can serialize unrelated misses; not interprocess locking. |
-| Native frame CSV and NVIDIA hardware log | Synthetic timing and parser tests; no device required. | Accepted-present interval percentiles, swap-chain present count (not physical scanout), global draw and shader cache deltas, NVIDIA board-wide telemetry. |
+| Contiguous linear texture copies | Byte-for-byte offset reference test across volume slices, mips and padded depth pitch. | One contiguous copy per plane when guest and host row pitches match; no extra copies of padding, fallback unchanged. |
+| Native frame CSV and NVIDIA hardware log | Synthetic timing and parser tests; no device required. | Accepted-present interval percentiles, swap-chain present count (not physical scanout), global draw, dispatch, dropped-work, shader and pipeline-library counter deltas, NVIDIA board-wide telemetry. |
 | Linux launcher, profiles and CI | Synthetic fake Proton directories, launcher tests, Python reporter tests, shell syntax checks and real cross-builds. | Separate runtime files from Git, retain view-tree Proton, release vs diagnostics binaries, avoid AMD FSR4 on NVIDIA. |
 
 No draw skipping, shader approximation, DRM bypass, synchronization bypass,
@@ -110,7 +111,7 @@ The two binaries are under target/x86_64-pc-windows-msvc/{release,diag}/valhalla
 CI builds both and uploads renamed executables with checksums. Full Linux
 workspace tests currently fail in existing victory-loader crash code, which
 references Windows APIs without a platform guard; the five selected crates
-pass (353 tests, 9 ignored). Windows GPU integration tests are not executed
+pass (354 tests, 9 ignored, including the new linear-copy regression). Windows GPU integration tests are not executed
 in this build-only session.
 
 Launch GUI with `python3 linux/launcher/valhalla.py` (PySide6 required).
@@ -169,7 +170,7 @@ the new shader optimization. Run old and new builds with identical settings
 to isolate the branch's changes. Runner outputs separate CSV, JSON, logs and
 hardware TSV under state/benchmarks; it disables FidelityFX frame generation
 and the overlay. Exit 124 means timeout, not successful game completion.
-Warmup is relative to meter initialization, and duration includes startup;
+Warmup is relative to the first accepted present, and duration includes startup;
 verify comparable scene coverage in the log. A/B runs are sequential and
 share caches by default; repeat in reverse order to control warm-cache bias.
 
@@ -180,8 +181,12 @@ python3 linux/benchmark.py report /absolute/path/frames.csv --warmup 30
 Frame CSV is opt-in (diagnostics builds, VICTORY_FRAME_CSV=/external/file.csv).
 Native FPS = accepted intervals / total seconds, median/p95/p99 in ms.
 Swap-chain present count is an API counter, not display scanout. Missing
-or reset counters yield null. Draw/shader counters are global deltas,
-not attribution to a specific pass. Hardware TSV is board-wide on NVIDIA
+or reset counters yield null. Draw/dispatch/drop/shader/pipeline counters are global deltas,
+not attribution to a specific pass. Pipeline make counter includes creation
+attempts; its load fraction is not a complete driver-cache hit rate.
+The recorder stays open across presenter recreation and flushes once per
+second; abrupt termination or a normal process exit can lose the final
+buffered second. Hardware TSV is board-wide on NVIDIA
 (nvidia-smi; VALHALLA_NVIDIA_GPU selects device), CPU from /proc, unknown
 fields are ?. No polling is required in release builds (NO_HW_LOG=1).
 
@@ -192,7 +197,10 @@ VICTORY_GPU_TIMING=1 and VICTORY_D3D12_DRED=light (times individual lists and
 marked commands, changes submission behavior, so not a clean FPS benchmark).
 Existing detailed logs report submission preparation, fence waits, copied
 bytes, descriptors, dropped pipeline causes, pipeline loads and compilation.
-These are sampled runtime logs, not yet aligned to each CSV row. Physical
+The JSON runner includes parsed periodic CPU/copy/fence-wait/drop
+samples and all-sample hardware summaries; they are not aligned to the
+warmup-filtered CSV intervals. Use `report --log ... --hardware ...`
+to include them in an offline report. Physical
 GPU execution time, exact scanout FPS, per-pass aggregation and per-frame
 VRAM/transfer accounting remain follow-up work.
 

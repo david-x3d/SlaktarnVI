@@ -838,6 +838,13 @@ mod library;
 #[cfg(windows)]
 mod make;
 
+/// Process-wide pipeline library counters (successful loads and make attempts).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn library_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (library::LOADED.load(Ordering::Relaxed), library::MADE.load(Ordering::Relaxed))
+}
+
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]

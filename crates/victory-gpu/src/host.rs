@@ -9402,8 +9402,6 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
 }
 
 struct Meter {
-    #[cfg(feature = "diagnostics")]
-    profile: Option<crate::perf_frame::Recorder>,
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
@@ -9419,8 +9417,6 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
-            #[cfg(feature = "diagnostics")]
-            profile: crate::perf_frame::Recorder::from_env(),
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
@@ -9701,7 +9697,7 @@ impl Meter {
                 }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                     {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
+                     {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} waiting for the \
                      GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
                      {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
@@ -10151,11 +10147,13 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
-                if let Some(recorder) = &mut p.meter.profile {
+                crate::perf_frame::present(frame as u64, || {
                     let count = p.swap_chain.GetLastPresentCount().ok();
                     let (hits, misses) = crate::shader_cache::counts();
-                    recorder.present(frame as u64, count, crate::draw::drawn(), hits, misses);
-                }
+                    let (loaded, made) = crate::pipeline::library_counts();
+                    (count, [crate::draw::drawn(), hits, misses, crate::draw::dropped_total(),
+                             crate::draw::dispatched(), loaded, made])
+                });
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
