@@ -2049,6 +2049,7 @@ impl ValueWait {
         met
     }
 
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
@@ -2066,6 +2067,14 @@ impl ValueWait {
             return true;
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    // The non-Windows build only exercises CPU-side structures. It has no
+    // guest process memory or host GPU to query; treat a nonzero address as
+    // unmapped, just as the Windows kernel read does on failure.
+    #[cfg(not(windows))]
+    fn holds(&self) -> bool {
+        true
     }
 
     /// Where the value waited for is: address and bytes.

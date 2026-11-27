@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use super::scheduling::WorkerConfig;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -352,14 +353,14 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            (worker_config().general / 4).max(1)
         }
     })
 }
 
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
-    /// [`SCREEN_WORKERS`] take.
+    /// dedicated screen workers take.
     screen: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
@@ -452,9 +453,6 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-/// Workers that make passes over the screen alone, besides the others.
-const SCREEN_WORKERS: usize = 2;
-
 /// The stack of a thread that makes host pipelines. Under Proton the
 /// driver's side of D3D12 (vkd3d-proton) turns each shader into SPIR-V in its
 /// own Windows code, on the asking thread, and for the title's largest
@@ -474,31 +472,31 @@ fn next(screens_only: bool) -> Arc<Pending> {
     }
 }
 
-/// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
-/// 64), else two thirds of the logical processors, 2 to 16. They run below the
-/// title's own threads, and a cold cache queues hundreds at once.
-fn worker_count(asked: Option<usize>, processors: usize) -> usize {
-    match asked {
-        Some(n) => n.clamp(1, 64),
-        None => (processors * 2 / 3).clamp(2, 16),
-    }
+/// Use one configuration for both the pool and its speculative slow limit.
+fn worker_config() -> WorkerConfig {
+    static CONFIG: OnceLock<WorkerConfig> = OnceLock::new();
+    *CONFIG.get_or_init(|| WorkerConfig::new(
+        std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
+        std::thread::available_parallelism().map_or(2, |n| n.get()),
+        crate::shadow::on_wine(),
+        screens_first(),
+    ))
 }
 
-/// Starts the workers ([`worker_count`]) on first use.
+/// Starts the workers ([`worker_config`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-        );
-        tracing::info!(workers, "pipeline workers");
-        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        let WorkerConfig { general: workers, screen: screens } = worker_config();
+        tracing::info!(workers, screens, total = workers + screens, "pipeline workers");
         for i in 0..workers + screens {
             let screens_only = i >= workers;
+            // With no general worker, use the existing synchronous fallback.
+            // A screen-only worker cannot drain an ordinary request.
+            if screens_only && !running {
+                break;
+            }
             // The host driver compiles on this thread: vkd3d-proton's DXIL
             // to SPIR-V recursion can pass the default 2 MiB (Wine, RADV).
             // Reserved, not committed.
@@ -562,15 +560,6 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
-        assert_eq!(worker_count(Some(0), 24), 1);
-        assert_eq!(worker_count(Some(20), 24), 20);
-    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

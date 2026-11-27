@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -13,11 +14,18 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        Self::from_parts(converter, &[input])
+    }
+
+    /// Hash a logical concatenation without allocating or copying its parts.
+    pub fn from_parts(converter: &dyn Converter, parts: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
-        h.update(input);
+        for part in parts {
+            h.update(part);
+        }
         CacheKey(h.finalize())
     }
 
@@ -30,6 +38,9 @@ impl CacheKey {
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
+    // Cache hits never take a lock. Bound synchronization memory, and avoid
+    // compiling the same key on multiple workers sharing this cache.
+    misses: Arc<[Mutex<()>; 256]>,
 }
 
 impl Cache {
@@ -38,7 +49,7 @@ impl Cache {
         let root = root.into();
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-        Ok(Cache { root })
+        Ok(Cache { root, misses: Arc::new(std::array::from_fn(|_| Mutex::new(()))) })
     }
 
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
@@ -49,14 +60,22 @@ impl Cache {
     /// Returns the cached output for `input`, converting it first if needed.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
-        let path = self.path_for(&key);
+        self.get_or_convert_key(&key, || converter.convert(input)
+            .with_context(|| format!("converter {} v{}", converter.id(), converter.version())))
+    }
+
+    /// Publish a conversion for a precomputed key. The closure must produce
+    /// the conversion of the exact bytes used to construct that key.
+    pub fn get_or_convert_key(&self, key: &CacheKey, convert: impl FnOnce() -> Result<Vec<u8>>) -> Result<PathBuf> {
+        let path = self.path_for(key);
         if path.is_file() {
-            tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
-        let output = converter
-            .convert(input)
-            .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
+        let _guard = self.misses[key.0.as_bytes()[0] as usize].lock().unwrap_or_else(|e| e.into_inner());
+        if path.is_file() {
+            return Ok(path);
+        }
+        let output = convert()?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
@@ -134,6 +153,33 @@ mod tests {
         let b = cache.get_or_convert(&conv, b"abc").unwrap();
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn segmented_key_preserves_existing_cache_format() {
+        let conv = Upper { version: 1, runs: AtomicUsize::new(0) };
+        let input = vec![42; 65536];
+        assert_eq!(CacheKey::new(&conv, &input), CacheKey::from_parts(&conv, &[&input[..32], &input[32..]]));
+    }
+
+    #[test]
+    fn concurrent_miss_only_converts_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper { version: 1, runs: AtomicUsize::new(0) };
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = cache.clone();
+                let (barrier, conv) = (&barrier, &conv);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let path = cache.get_or_convert(conv, b"abc").unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), b"ABC");
+                });
+            }
+        });
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
     }
 

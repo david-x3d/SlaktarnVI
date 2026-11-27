@@ -21,5 +21,4 @@ PY
 # OVERRIDE="VICTORY_X=1 VICTORY_Y=2": what this run changes after the preset
 # (e.g. one setting measured against S70).
 for kv in ${OVERRIDE:-}; do export "$kv"; done
-cp run-7900.sh .run-s70.sh
-exec ./.run-s70.sh
+exec ./run-7900.sh

@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// The encoding of entries ([`encode`]), part of the key.
 const FORMAT: u32 = 2;
 
-use victory_pipeline::{Cache, Converter};
+use victory_pipeline::{Cache, CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
@@ -203,8 +203,14 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.convert_container(&input[32..])
+    }
+}
+
+impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Translate<'_, F> {
+    fn convert_container(&self, container: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(container).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader, self.source))
     }
 }
@@ -230,16 +236,16 @@ fn cached_by(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         source,
         ran: AtomicBool::new(false),
     };
+    let key = CacheKey::from_parts(&converter, &[build, container]);
     let mut old: Option<HostShader> = None;
     for _ in 0..3 {
         let path = cache
-            .get_or_convert(&converter, &input)
+            .get_or_convert_key(&key, || converter.convert_container(container))
             .map_err(|e| format!("{e:#}"))?;
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let ran = converter.ran.load(Ordering::Relaxed);

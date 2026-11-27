@@ -582,7 +582,10 @@ impl SentRuns {
             return;
         }
         match self.0.iter_mut().find(|s| s.0 == number) {
-            Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
+            Some((_, all)) => {
+                all.extend(ranges);
+                join_in_place(all);
+            }
             None => self.0.push((number, ranges)),
         }
     }
@@ -751,17 +754,25 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    // (The sort that finds what is in order already: they come as a few
-    // stretches of tens of thousands in order, put behind one another.)
-    ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    join_in_place(&mut ranges);
+    ranges
+}
+
+/// Compact dirty ranges in their existing allocation. No auxiliary sort
+/// buffer or second vector proportional to the number of writes.
+fn join_in_place(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable();
+    let mut kept = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if kept != 0 && from <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+        } else {
+            ranges[kept] = (from, to);
+            kept += 1;
         }
     }
-    out
+    ranges.truncate(kept);
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -907,6 +918,17 @@ mod card_tests {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
     }
+
+    #[test]
+    fn joining_ranges_reuses_allocation_and_preserves_exact_coverage() {
+        let ranges = vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31), (8, 9)];
+        let allocation = ranges.as_ptr();
+        let covered = |ranges: &[(usize, usize)], at| ranges.iter().any(|&(a, b)| a <= at && at < b);
+        let before: Vec<_> = (0..32).map(|at| covered(&ranges, at)).collect();
+        let merged = joined(ranges);
+        assert_eq!(merged.as_ptr(), allocation);
+        assert_eq!(before, (0..32).map(|at| covered(&merged, at)).collect::<Vec<_>>());
+    }
 }
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
@@ -1043,6 +1065,18 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
         out.push((at, to));
     }
     out
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_subtraction_preserves_exact_uncovered_bytes() {
+    let skip = vec![(12, 18), (3, 7), (5, 13), (22, 31), (40, 50)];
+    let parts = outside(4, 25, skip.clone());
+    assert_eq!(parts, [(18, 22)]);
+    for at in 0..50 {
+        let expected = (4..25).contains(&at) && !skip.iter().any(|&(a, b)| (a..b).contains(&at));
+        assert_eq!(parts.iter().any(|&(a, b)| (a..b).contains(&at)), expected);
+    }
 }
 
 #[cfg(test)]
@@ -2972,23 +3006,18 @@ fn window_budget() -> Option<u64> {
     })
 }
 
-/// Oldest eligible copies to remove until their unique bytes fit `keep`.
+/// Oldest eligible copies to remove until all live window bytes fit `keep`
+/// (or there are no eligible copies left).
 /// Entries are `(last-used moment, bytes, unique copy identity)`, already
 /// sorted oldest first; one copy standing under several keys counts once.
-fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
-    let mut left = 0u64;
+fn window_victims(entries: &[(u64, u64, usize)], mut left: u64, keep: u64) -> Vec<usize> {
     let mut seen = std::collections::HashSet::new();
-    for &(_, bytes, id) in entries {
-        if seen.insert(id) {
-            left = left.saturating_add(bytes);
-        }
-    }
     let mut out = Vec::new();
     for (i, &(_, bytes, id)) in entries.iter().enumerate() {
         if left <= keep {
             break;
         }
-        if seen.remove(&id) {
+        if seen.insert(id) {
             left = left.saturating_sub(bytes);
             out.push(i);
         }
@@ -3059,11 +3088,17 @@ pub(crate) fn let_go_idle() {
         let victims = if keep == u64::MAX {
             (0..eligible.len()).collect()
         } else {
+            // The cap is on all cached windows, including those still held
+            // by lists and descriptors. Counting only eligible windows
+            // retained idle copies even when live ones already exceeded it.
+            let mut seen = std::collections::HashSet::new();
+            let live = map.values().filter(|s| seen.insert(Arc::as_ptr(s)))
+                .fold(0u64, |sum, s| sum.saturating_add(s.len));
             let entries: Vec<(u64, u64, usize)> = eligible
                 .iter()
                 .map(|&(used, _, id, len)| (used, len, id))
                 .collect();
-            window_victims(&entries, keep)
+            window_victims(&entries, live, keep)
         };
         victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
@@ -3298,26 +3333,18 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        let (from, to) = self.inside(address, len);
+        let start = self.start as usize;
+        // Subtract the union once rather than allocating a replacement
+        // vector for every prior declaration (even disjoint ones).
+        let skip = pending.iter().filter(|&&(a, e)| a < start + to && e > start + from)
+            .map(|&(a, e)| self.inside(a, e - a)).collect();
+        let parts = outside(from, to, skip);
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        if taken == 0 {
+            return;
+        }
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -3442,9 +3469,14 @@ impl Shadow {
                 };
                 // Title memory as read, beside it with the card's bytes put
                 // in: only the dwords that differ are written.
-                let was: Vec<u8> = title.iter().zip(&mask).map(|(now, changed)| now ^ changed).collect();
                 if !runs.is_empty() {
-                    written += put_changed(start + at + first, &was[..n], &title[..n]);
+                    // The XOR mask is no longer needed; reconstruct the old
+                    // title bytes in its scratch allocation instead of
+                    // allocating another buffer for each differing piece.
+                    for (changed, now) in mask.iter_mut().zip(&title) {
+                        *changed ^= *now;
+                    }
+                    written += put_changed(start + at + first, &mask[..n], &title[..n]);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -4342,9 +4374,16 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                let runs = if whole {
+                    held.copy_from_slice(title);
+                    vec![(0, n)]
+                } else {
+                    // Existing exact word comparison (AVX2 where aligned),
+                    // fused with updating the reference. Only changed words
+                    // are reported for the GPU upload, including on tails.
+                    word_runs_put(at, title, held)
+                };
                 for &(a, len) in &runs {
-                    held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
@@ -5886,9 +5925,9 @@ mod window_tests {
         // Oldest first: 10, 20 and 30 MiB. Keeping 50 MiB must free only the
         // oldest copy (60 MiB left before, 50 MiB after).
         let entries = [(1u64, 10 * M, 1usize), (2, 20 * M, 2), (3, 30 * M, 3)];
-        assert_eq!(window_victims(&entries, 50 * M), vec![0]);
+        assert_eq!(window_victims(&entries, 60 * M, 50 * M), vec![0]);
         // A tighter cap takes the newest as well.
-        assert_eq!(window_victims(&entries, 20 * M), vec![0, 1, 2]);
+        assert_eq!(window_victims(&entries, 60 * M, 20 * M), vec![0, 1, 2]);
     }
 
     #[test]
@@ -5897,7 +5936,17 @@ mod window_tests {
         // The first two entries are one copy; 50 MiB is live, not 80.
         // Without dedupe both would be picked to reach a 40 MiB cap.
         let entries = [(1u64, 30 * M, 7usize), (2, 30 * M, 7), (3, 20 * M, 8)];
-        assert_eq!(window_victims(&entries, 40 * M), vec![0]);
+        assert_eq!(window_victims(&entries, 50 * M, 40 * M), vec![0]);
+    }
+
+    #[test]
+    fn window_budget_includes_copies_still_held_by_lists_and_views() {
+        const M: u64 = 1 << 20;
+        let eligible = [(1u64, 10 * M, 1usize), (2, 20 * M, 2)];
+        // 40 MiB remains in use; only the idle 30 MiB can be removed.
+        assert_eq!(window_victims(&eligible, 70 * M, 50 * M), vec![0, 1]);
+        assert_eq!(window_victims(&eligible, 70 * M, 20 * M), vec![0, 1]);
+        assert!(window_victims(&eligible, 70 * M, 70 * M).is_empty());
     }
 
     #[test]

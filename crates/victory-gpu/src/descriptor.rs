@@ -411,6 +411,7 @@ fn sync_heaps_held() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let mirrored_end = start as usize + mirrored_count as usize * step as usize;
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
@@ -455,13 +456,27 @@ fn sync_heaps_held() {
             }
             let pages = crate::port_descriptors::to_check(frame);
             (parts, taken_in_check) = crate::port_descriptors::plan_parts(start, end, step, mirrored_count, &runs, &pages, crate::watch::PAGE);
+            // Marked runs and fallback checks may extend past the cap.
+            if mirrored_count < heap.desc.count {
+                parts.retain_mut(|(from, to, _)| {
+                    if let Some((_, end)) = cap_sync_range((*from, *to), mirrored_end) {
+                        *to = end;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
         } else {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
             let taken = written.take(start as usize, end as usize);
             phase.end();
             spent[0] += since(began);
-            for (range_from, range_end) in taken {
+            // Still consume the entire write-watch range, but do not read or
+            // schedule pages for title slots that have no host counterpart.
+            // The capped view heap reserves those slots for dynamic tables.
+            for (range_from, range_end) in taken.into_iter().filter_map(|range| cap_sync_range(range, mirrored_end)) {
                 let mut page = range_from & !(crate::watch::PAGE - 1);
                 while page < range_end {
                     parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end), false));
@@ -826,6 +841,13 @@ pub(crate) fn sync_line(frames: f64) {
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
     );
+}
+
+/// Intersect an already consumed write-watch range with the mirrored heap.
+#[cfg(windows)]
+fn cap_sync_range((from, to): (usize, usize), mirrored_end: usize) -> Option<(usize, usize)> {
+    let to = to.min(mirrored_end);
+    (from < to).then_some((from, to))
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -1844,6 +1866,21 @@ mod tests {
             ),
             5..5
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capped_heap_sync_does_not_read_unmirrored_bytes() {
+        let start = 0x1000;
+        let cap = start + 5 * 32;
+        assert_eq!(cap_sync_range((start, start + 32), cap), Some((start, start + 32)));
+        assert_eq!(cap_sync_range((start + 4 * 32, start + 9 * 32), cap), Some((start + 4 * 32, cap)));
+        assert_eq!(cap_sync_range((cap, cap + 32), cap), None);
+        assert_eq!(cap_sync_range((cap + 32, cap + 64), cap), None);
+        assert_eq!(cap_sync_range((start, start + 32), start), None);
+        // The clipped range ends at a full descriptor, not a partial one.
+        let (from, to) = cap_sync_range((start + 4 * 32, cap + 1), cap).unwrap();
+        assert_eq!(changed_slots(from, to, start, 32, 5), 4..5);
     }
 
     /// A table made afresh for a draw holds the descriptors its shader

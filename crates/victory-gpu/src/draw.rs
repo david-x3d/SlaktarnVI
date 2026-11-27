@@ -17,12 +17,54 @@ use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+    DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+};
 use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+
+// Depth companion matching adapted from Vice-Tay 292adb5 (GPL-3.0).
+fn is_depth_srv(desc: &[u32; 10]) -> bool {
+    let format = DXGI_FORMAT(crate::resource::pc_format(desc[0]) as i32);
+    // In a Texture2D SRV, the union starts at word 4 and PlaneSlice is word 6.
+    desc[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
+        && desc[6] == 0
+        && !matches!(format, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT | DXGI_FORMAT_X24_TYPELESS_G8_UINT)
+}
+
+/// Accept a depth view of the same subresources as a bound stencil view.
+fn is_depth_companion(stencil: &View, depth: &View) -> bool {
+    let (stencil_desc, depth_desc): (&[u32], &[u32]) = match (stencil, depth) {
+        (View::Shader(a, Some(stencil)), View::Shader(b, Some(depth))) if a == b && *a != 0 => {
+            (stencil, depth)
+        }
+        (View::Placed(false, _, stencil_desc), View::Placed(false, _, depth_desc))
+            if crate::descriptor::host::same_placed_texture(stencil, depth) =>
+        {
+            (stencil_desc, depth_desc)
+        }
+        _ => return false,
+    };
+    let format = |view: &[u32]| DXGI_FORMAT(crate::resource::pc_format(view[0]) as i32);
+    let expected = match format(stencil_desc) {
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        DXGI_FORMAT_X24_TYPELESS_G8_UINT => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        _ => return false,
+    };
+    let texture_2d = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+    stencil_desc[1] == texture_2d
+        && depth_desc[1] == texture_2d
+        && stencil_desc[6] == 1
+        && depth_desc[6] == 0
+        && format(depth_desc) == expected
+        && depth_desc[2] == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        && stencil_desc[4..6] == depth_desc[4..6]
+        && stencil_desc[7] == depth_desc[7]
+}
 
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
@@ -1100,6 +1142,19 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn count_dropped() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dropped_total() -> u64 {
+    DROPPED_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -3188,13 +3243,13 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3207,7 +3262,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3220,7 +3275,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3334,11 +3389,30 @@ impl State {
         t.used.iter().find(|u| {
             u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
         })?;
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            return None;
-        };
-        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-            View::Shader(r, _) | View::Unordered(r, ..) => r,
+        let view = self.bound_table_view(compute, (slot, offset))?;
+        let placed = crate::descriptor::host::placed_texture(&view);
+        let ((slot, offset), resource) = match (kind, placed.as_ref().unwrap_or(&view)) {
+            (ResourceType::Srv, View::Shader(r, desc)) if desc.as_ref().is_none_or(is_depth_srv) => {
+                ((slot, offset), *r)
+            }
+            (ResourceType::Uav, View::Unordered(r, ..)) => ((slot, offset), *r),
+            (ResourceType::Srv, _) if compute && (slot, offset) == crate::ambient::DEPTH => {
+                // The diffuse resolve can bind the stencil plane at the usual
+                // slot. Use a depth view already read by the same dispatch.
+                let (at, depth) = t.used.iter()
+                    .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                    .map(|u| (u.slot, u.table_offset_dwords))
+                    .filter(|at| *at != (slot, offset))
+                    .find_map(|at| {
+                        let depth = self.bound_table_view(compute, at)?;
+                        is_depth_companion(&view, &depth).then_some((at, depth))
+                    })?;
+                let placed = crate::descriptor::host::placed_texture(&depth);
+                let View::Shader(resource, _) = placed.as_ref().unwrap_or(&depth) else {
+                    return None;
+                };
+                (at, *resource)
+            }
             _ => return None,
         };
         let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -3348,7 +3422,14 @@ impl State {
         let host = crate::resource::host_resource(resource as This)?;
         // SAFETY: a live resource.
         let desc = unsafe { host.GetDesc() };
-        Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        Some((desc, heap.gpu_handle(start.checked_add(offset.checked_mul(4)?)? / 32)))
+    }
+
+    fn bound_table_view(&self, compute: bool, (slot, offset): (u8, u32)) -> Option<View> {
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return None;
+        };
+        crate::descriptor::view(table.checked_add(u64::from(offset) * 4)?)
     }
 
     /// The place in the bound view heap of the view a shader of the bound
@@ -3775,7 +3856,7 @@ impl State {
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4346,7 +4427,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4451,7 +4532,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -5451,6 +5532,40 @@ mod tests {
         assert!(ConstantBufferTrace::parse(&format!("{HASH}:2:3")).is_none());
         assert!(ConstantBufferTrace::parse("1234:2:0").is_none());
     }
+    #[test]
+    fn depth_srv_checks_the_plane_not_the_number_of_levels() {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT};
+
+        let mut desc = [0; 10];
+        desc[0] = DXGI_FORMAT_R24_UNORM_X8_TYPELESS.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        desc[5] = 1;
+        assert!(super::is_depth_srv(&desc));
+        desc[6] = 1;
+        assert!(!super::is_depth_srv(&desc));
+        desc[6] = 0;
+        desc[0] = DXGI_FORMAT_X24_TYPELESS_G8_UINT.0 as u32;
+        assert!(!super::is_depth_srv(&desc));
+        desc[0] = DXGI_FORMAT_R24_UNORM_X8_TYPELESS.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32;
+        assert!(!super::is_depth_srv(&desc));
+    }
+
+    #[test]
+    fn the_reported_stencil_view_requires_its_matching_depth_plane() {
+        let words = [22, 4, 5768, 0, 0, 1, 1, 0, 0, 0];
+        let stencil = super::View::Shader(1, Some(words));
+        let mut depth = words;
+        depth[0] = 21;
+        depth[6] = 0;
+        assert!(!super::is_depth_companion(&stencil, &stencil));
+        assert!(super::is_depth_companion(&stencil, &super::View::Shader(1, Some(depth))));
+        assert!(!super::is_depth_companion(&stencil, &super::View::Shader(2, Some(depth))));
+        depth[4] = 1;
+        assert!(!super::is_depth_companion(&stencil, &super::View::Shader(1, Some(depth))));
+    }
+
     #[test]
     fn staging_budget_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;

@@ -44,6 +44,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+mod perf_frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -81,6 +83,8 @@ pub mod queue;
 pub mod replay;
 #[cfg(windows)]
 mod residency;
+#[cfg(any(test, windows))]
+mod residency_batch;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

@@ -23,6 +23,7 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
 // (Only the stack dumps' unwinding, a diagnostics tool, runs guarded.)
 #[cfg(all(windows, feature = "diagnostics"))]

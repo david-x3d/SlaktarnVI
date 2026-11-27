@@ -251,6 +251,7 @@ struct Aside {
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
     value: u64,
+    covered: crate::residency_batch::Completed,
     _keep: (ID3D12CommandAllocator, [ID3D12Resource; 2]),
 }
 // SAFETY: D3D12 objects are free-threaded, the event is waited on by one
@@ -268,6 +269,14 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     if !wait_resident() {
         return Ok(());
     }
+    // The existing one-device mapping barrier is preserved. Requests arriving
+    // during the previous wait can share the next fence, but never one submitted
+    // before their own MakeResident. Keep opt-in until physical A/B validation.
+    static BATCH: OnceLock<bool> = OnceLock::new();
+    static REQUESTS: OnceLock<crate::residency_batch::Requests> = OnceLock::new();
+    let batch = *BATCH.get_or_init(|| crate::switch::on("VICTORY_BATCH_RESIDENCY"));
+    let requests = REQUESTS.get_or_init(Default::default);
+    let ticket = if batch { requests.register() } else { 0 };
     let started = std::time::Instant::now();
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: plain object creation; the objects the list names are kept.
@@ -310,16 +319,36 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 event: CreateEventW(None, false, false, None)?,
                 value: 0,
+                covered: Default::default(),
                 _keep: (allocator, [from, to]),
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
+        if batch && a.covered.covers(ticket) {
+            let n = MAPPED_BATCHED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(1000) {
+                tracing::info!(n, "mapping barrier requests coalesced");
+            }
+            return Ok(());
+        }
+        // Snapshot before submission: late registrations need their own fence.
+        let snapshot = if batch { requests.snapshot() } else { 0 };
         a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
+            let waited = WaitForSingleObject(a.event, INFINITE);
+            if waited != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                return Err(windows::core::Error::from_thread());
+            }
+        }
+        let complete = a.fence.GetCompletedValue();
+        if complete == u64::MAX || complete < a.value {
+            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+        }
+        if batch {
+            a.covered.complete(snapshot);
         }
     }
     let us = started.elapsed().as_micros() as u64;
@@ -338,6 +367,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 }
 
 /// Times, microseconds and the longest of [`mapped`].
+static MAPPED_BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
@@ -6051,7 +6081,7 @@ impl Host {
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
+            if let Some([front, behind]) = self.span_lists(*submitted) {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
@@ -9697,7 +9727,7 @@ impl Meter {
                 }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                     {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
+                     {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} waiting for the \
                      GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
                      {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
@@ -10144,6 +10174,16 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
+            }
+            #[cfg(feature = "diagnostics")]
+            if status == windows::Win32::Foundation::S_OK {
+                crate::perf_frame::present(frame as u64, || {
+                    let count = p.swap_chain.GetLastPresentCount().ok();
+                    let (hits, misses) = crate::shader_cache::counts();
+                    let (loaded, made) = crate::pipeline::library_counts();
+                    (count, [crate::draw::drawn(), hits, misses, crate::draw::dropped_total(),
+                             crate::draw::dispatched(), loaded, made])
+                });
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
