@@ -142,6 +142,12 @@ class Settings:
 
 
 PRESETS: dict[str, dict] = {
+    # Request the title's original graphics path, not a promise that all
+    # translated shaders or the experimental BVH builder are supported.
+    "Xbox fidelity (experimental)": dict(resolution="2560x1440", upscaler="game", render_scale="Default",
+                         fsr4=False, frame_generation=False, frame_cap="30 fps", console="series-x",
+                         low_memory=False, ray_tracing=True, ambient=0.0, reflections_hold=False,
+                         safe_mode=False, pipeline_wait_ms=500),
     "Compatibility": dict(resolution="1920x1080", upscaler="game", render_scale="Default", fsr4=False,
                           frame_generation=False, frame_cap="60 fps", console="series-s", low_memory=False,
                           ray_tracing=False, safe_mode=True, pipeline_wait_ms=500),
@@ -235,6 +241,11 @@ def launch_env(s: Settings) -> dict[str, str]:
         env.update({k: "0" for k in ("VICTORY_TEXTURE_NO_WAIT", "VICTORY_THIN", "VICTORY_UPLOAD_AHEAD",
                                         "VICTORY_PORT_DESCRIPTORS", "VICTORY_PORT_CONSTANTS", "VICTORY_PORT_PRIVATE",
                                         "VICTORY_PORT_CBV")})
+    if s.preset == "Xbox fidelity (experimental)":
+        env.update(VICTORY_WAVE_LOCAL="idiom", VICTORY_WAVE_WIDE="0",
+                   VICTORY_AMBIENT_RT="", VICTORY_BVH_QUARANTINE="0",
+                   VICTORY_FIDELITYFX_FRAMEGEN="0",
+                   VK_LOADER_LAYERS_DISABLE="VK_LAYER_LSFGVK_frame_generation")
     if s.preset == "Experimental":
         env["VICTORY_SHADER_OPT"] = "127"  # opt-in vectorized raw loads; needs NVIDIA A/B
     if s.low_memory:
@@ -249,8 +260,12 @@ def process_env(s: Settings) -> dict[str, str]:
     env = dict(os.environ)
     # Switching profiles must clear settings inherited from an earlier preset.
     for key in ("FSR4_UPGRADE", "PROTON_FSR4_UPGRADE", "VICTORY_FIDELITYFX_FRAMEGEN", "VICTORY_UPSCALER",
-                "VICTORY_FFX_SCALE", "VICTORY_RENDER_SCALE", "VICTORY_FIDELITYFX_DIR", "SAFE", "RT", "CONSOLE"):
+                "VICTORY_FFX_SCALE", "VICTORY_RENDER_SCALE", "VICTORY_FIDELITYFX_DIR", "SAFE", "RT", "CONSOLE",
+                "VICTORY_BVH_BUILDER", "VICTORY_WAVE_LOCAL", "VICTORY_WAVE_WIDE", "VICTORY_AMBIENT_RT",
+                "VICTORY_BVH_QUARANTINE"):
         env.pop(key, None)
+    if s.preset == "Xbox fidelity (experimental)":
+        env.pop("VK_INSTANCE_LAYERS", None)
     env.update(launch_env(s))
     return env
 
@@ -747,7 +762,7 @@ def run_window() -> int:
             sh = QHBoxLayout(slider)
             sh.setContentsMargins(0, 0, 0, 0)
             self.ambient = QSlider(Qt.Horizontal)
-            self.ambient.setRange(40, 140)
+            self.ambient.setRange(0, 140)
             self.ambient.setFixedWidth(150)
             self.ambient_label = label("", "rowdesc")
             self.ambient_label.setFixedWidth(34)
@@ -758,7 +773,7 @@ def run_window() -> int:
             rows.add("Hold reflections", "Keeps reflections to the light around them: no open-sky glow indoors.",
                      self.reflections_hold)
             self.ray_tracing = Toggle()
-            rows.add("Ray tracing", "Experimental. The game's ray-traced indirect light, about a third slower.",
+            rows.add("Ray tracing", "Experimental: requests the original ray-tracing builder. Runs only if all stages can translate; visual parity is not guaranteed.",
                      self.ray_tracing)
             v.addStretch(1)
             self.stack.addWidget(area)
@@ -1121,6 +1136,11 @@ def selftest() -> int:
     assert s70["VICTORY_OUTPUT"] == "2560x1440" and s70["VICTORY_FFX_SCALE"] == "0.6667", s70
     assert s70["FSR4_UPGRADE"] == "1" and s70["VICTORY_FIDELITYFX_FRAMEGEN"] == "1", s70
     assert s70["VICTORY_FRAME_INTERVAL_MS"] == "16.667" and "CONSOLE" not in s70 and "VICTORY_WINDOW_PLAIN" not in s70, s70
+    fidelity = launch_env(apply_preset(Settings(vendor="nvidia"), "Xbox fidelity (experimental)"))
+    assert "CONSOLE" not in fidelity and "VICTORY_RENDER_SCALE" not in fidelity
+    assert fidelity["RT"] == "1" and fidelity["VICTORY_WAVE_LOCAL"] == "idiom"
+    assert fidelity["VICTORY_WAVE_WIDE"] == "0" and fidelity["VICTORY_AMBIENT"] == "0"
+    assert fidelity["VICTORY_AMBIENT_REFLECT"] == "0" and fidelity["VICTORY_FIDELITYFX_FRAMEGEN"] == "0"
     nvidia = launch_env(apply_preset(Settings(vendor="nvidia"), "Performance"))
     assert nvidia["CONSOLE"] == "series-s" and nvidia["VICTORY_FRAME_INTERVAL_MS"] == "8.333"
     assert not {"FSR4_UPGRADE", "PROTON_FSR4_UPGRADE", "VICTORY_FIDELITYFX_FRAMEGEN"} & nvidia.keys()
