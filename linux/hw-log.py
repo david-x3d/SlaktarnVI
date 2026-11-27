@@ -194,7 +194,7 @@ def main():
             row = [f"{now - start:.1f}", *gpu_sample(vendor, dev, hwmon), f"{cpu:.0f}",
                    str(temp_by_label(cpu_hwmon, "Tctl")), f"{game:.0f}", *drm_memory(pid), top, ram_used()]
             out.write("\t".join(row) + "\n")
-            prev_cpu, prev_t, prev_time = total, t, now
+            prev_cpu, prev_t, prev_time = (total, idle), t, now
 
 
 if __name__ == "__main__":
