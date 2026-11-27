@@ -692,7 +692,11 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    // An adapter with 32-lane waves cannot create a pipeline for the
+    // original Wave64 module after all compatible lowering attempts fail.
+    // Do not rewrite its wave metadata: its LDS/cross-lane semantics still
+    // require 64 lanes. Report an unsupported translation instead.
+    let original = original.and_then(require_host_wave);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -706,7 +710,17 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res).and_then(require_host_wave)
+}
+
+fn require_host_wave((shader, wave): (HostShader, Option<u32>)) -> Result<HostShader, ShaderError> {
+    if lower::host_max_wave() == 32 && wave == Some(64) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a Wave64 shader without a compatible Wave32 lowering",
+        });
+    }
+    Ok(shader)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

@@ -14152,10 +14152,22 @@ mod tests {
             let c = crate::dxbc::Container::empty_for_tests();
             let was = super::TEST_HOST_WAVE.replace(Some(32));
             let original = super::super::emit_program(&c, &native, &p, &st, &io, &res);
+            let original = original.unwrap();
+            assert_eq!(original.1, Some(if ordered { 64 } else { 32 }));
+            // A genuine Wave64 requirement is refused on Wave32 rather
+            // than hiding it by changing the required width in the metadata.
+            let checked = super::super::require_host_wave(original.clone());
+            if ordered {
+                assert!(matches!(checked, Err(crate::ShaderError::Unsupported { what: "a Wave64 shader without a compatible Wave32 lowering", .. })));
+            } else {
+                assert_eq!(checked.unwrap(), original.0);
+            }
+            super::TEST_HOST_WAVE.set(Some(64));
+            assert_eq!(super::super::require_host_wave(original.clone()).unwrap(), original.0);
+            super::TEST_HOST_WAVE.set(Some(32));
             let translated = super::super::emit(&c, &native, &p, &st, &io, &res);
             super::TEST_HOST_WAVE.set(was);
             assert_eq!(super::lds_meetings(&p, &st, &all).is_none(), ordered);
-            assert_eq!(original.unwrap().1, Some(if ordered { 64 } else { 32 }));
             let shader = translated.unwrap();
             if ordered {
                 // Removing the EXEC skip puts both atomics in all-lane blocks:
