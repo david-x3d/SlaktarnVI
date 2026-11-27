@@ -15,7 +15,7 @@ jobs:
       - name: Install pinned Rust
         run: rustup show
       - name: Portable regression tests
-        run: cargo test --locked -p victory-core -p victory-formats -p victory-pipeline -p victory-shader -p victory-gpu --lib
+        run: cargo test --locked -p victory-core -p victory-formats -p victory-pipeline -p victory-shader -p victory-gpu -p victory-loader -p victory-hle --lib
       - name: Launcher and report tests
         run: |
           python3 -I linux/launcher/valhalla.py --selftest

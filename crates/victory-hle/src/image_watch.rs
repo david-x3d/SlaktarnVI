@@ -6,8 +6,10 @@
 //! `VICTORY_IMAGE_WATCH=used=98d26d8:8,failed=98d26d0:1`: a name, the offset
 //! in the image (hexadecimal) and the bytes (1, 2, 4 or 8).
 
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(any(windows, test))]
 struct Word {
     name: String,
     offset: usize,
@@ -15,6 +17,7 @@ struct Word {
 }
 
 /// The words `text` names; what cannot be read of it is left out.
+#[cfg(any(windows, test))]
 fn words(text: &str) -> Vec<Word> {
     text.split(',')
         .filter_map(|part| {
@@ -28,6 +31,7 @@ fn words(text: &str) -> Vec<Word> {
 }
 
 /// `word` of the image at `base`; `None` if it cannot be read.
+#[cfg(windows)]
 fn read(base: usize, word: &Word) -> Option<u64> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -47,6 +51,7 @@ fn read(base: usize, word: &Word) -> Option<u64> {
 }
 
 /// Starts watching the image at `base`, if asked for.
+#[cfg(windows)]
 pub(crate) fn start(base: usize) {
     let Ok(text) = std::env::var("VICTORY_IMAGE_WATCH") else {
         return;
@@ -80,6 +85,9 @@ pub(crate) fn start(base: usize) {
     });
 }
 
+#[cfg(not(windows))]
+pub(crate) fn start(_: usize) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +98,11 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!((all[0].name.as_str(), all[0].offset, all[0].bytes), ("used", 0x98d_26d8, 8));
         assert_eq!((all[1].name.as_str(), all[1].offset, all[1].bytes), ("failed", 0x10, 1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safely_reads_process_memory() {
         let memory = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let word = |offset, bytes| Word { name: String::new(), offset, bytes };
         let base = memory.as_ptr() as usize;
