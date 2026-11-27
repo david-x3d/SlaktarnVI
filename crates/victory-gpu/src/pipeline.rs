@@ -837,6 +837,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod scheduling;
 
 /// Process-wide pipeline library counters (successful loads and make attempts).
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -16,7 +16,8 @@
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
 //! Thread Safety), with one exception kept here: two loads of the same
-//! pipeline are made one after the other ([`same_name`]). Under one lock of
+//! pipeline are made one after the other, including cache miss compilation
+//! and storage ([`same_name`]). Under one lock of
 //! ours for every call, the eight workers made pipelines one at a time:
 //! 87 to 96 of 110 looks at each worker found it waiting for that lock
 //! (run 49), and an earlier run's 2,300 pipelines, all in the library, were
@@ -50,7 +51,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+
+use super::scheduling::KeyGates;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -415,14 +418,11 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// Serialize the full load/create/store sequence for one host pipeline.
+/// Distinct names never share a compile lock.
+fn same_name(name: &str) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<KeyGates> = OnceLock::new();
+    GATES.get_or_init(KeyGates::default).get(name)
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -626,10 +626,14 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
+    let gate = same_name(name);
+    let _one = {
+        let _waiting = crate::timeline::span("pipeline: wait for same PSO");
+        gate.lock().unwrap_or_else(|e| e.into_inner())
+    };
     let loaded = {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         loading.next("pipeline: load a PSO from the driver library");
         load(&library.library, PCWSTR(wide.as_ptr()))
@@ -648,7 +652,8 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compiled outside the global library lock: unrelated PSOs can compile
+    // concurrently, while another request for this name will load our result.
     let pso = {
         let _call = call("make", name);
         create()?
