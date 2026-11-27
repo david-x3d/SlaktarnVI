@@ -86,7 +86,7 @@ LOG_SAMPLE = re.compile(
 
 
 def log_samples(path):
-    samples, reasons, mapping, passes, budgets = [], [], [], [], []
+    samples, reasons, mapping, passes, budgets, gpu_spans = [], [], [], [], [], []
     with open(path, errors="replace") as file:
         for line in file:
             if match := LOG_SAMPLE.search(line):
@@ -100,7 +100,11 @@ def log_samples(path):
                 budgets.append({"local_used_mb": int(match[1]), "local_budget_mb": int(match[2]), "nonlocal_used_mb": int(match[3])})
             if match := re.search(r"the card's time by command \(timing run\): ([\d.]+) ms a frame in ([\d.]+) commands a frame, the longest ([\d.]+) ms: (.*)", line):
                 passes.append({"gpu_timestamp_ms_per_frame": float(match[1]), "commands_per_frame": float(match[2]), "longest_ms": float(match[3]), "command": match[4].strip()})
+            if match := re.search(r"the card's own stamps per frame: ([\d.]+) submissions, working ([\d.]+) ms, idle between them ([\d.]+) ms, the longest ([\d.]+) ms", line):
+                gpu_spans.append({"submissions_per_frame": float(match[1]), "gpu_busy_ms_per_frame": float(match[2]),
+                                  "gpu_between_ms_per_frame": float(match[3]), "longest_submission_ms": float(match[4])})
     return {"periodic_frame_samples": samples, "periodic_drop_reasons": reasons,
+            "gpu_queue_timestamp_samples_delayed": gpu_spans,
             "mapping_barriers_last": mapping[-1] if mapping else None,
             "gpu_memory_budget_samples": budgets,
             "gpu_timestamp_command_samples": passes,
@@ -141,7 +145,9 @@ def run(args):
             env[key] = value
         env.update(VICTORY_DIAGNOSTICS="1", VICTORY_PANEL="0", VICTORY_FIDELITYFX_FRAMEGEN="0",
                    SECS=str(args.duration), LOG=str(directory / "run.log"),
-                   VICTORY_FRAME_CSV=str(directory / "frames.csv"))
+                   VICTORY_FRAME_CSV="Z:" + str(directory / "frames.csv").replace("/", "\\"),
+                   VK_LOADER_LAYERS_DISABLE="VK_LAYER_LSFGVK_frame_generation")
+        env.pop("VK_INSTANCE_LAYERS", None)
         (directory / "config.json").write_text(json.dumps({
             "overrides": overrides, "duration": args.duration, "warmup": args.warmup,
             "frame_generation_requested": False}, indent=2) + "\n")
@@ -184,7 +190,10 @@ def selftest():
             f.write("10.0 fps, 100.0 ms/frame (2.0 preparing: copies 1.0 ms 2.0 MB, textures 3.0 ms 4.0 MB; 20.0 waiting for the GPU; 1.0 copying back 0.5 MB), 25 draws/frame, dropped 4 without a host pipeline (7 being made) and 2 indirect\n")
             f.write("new card memory waited for until it is mapped (test), since the start: 100 times, 70.0 ms, the longest 2.0 ms\n")
             f.write("the card's time by command (timing run): 1.25 ms a frame in 2.0 commands a frame, the longest 0.8 ms: draw [test]\n")
+        with log.open("a") as f:
+            f.write("the card's own stamps per frame: 41.0 submissions, working 235.0 ms, idle between them 27.0 ms, the longest 90.0 ms\n")
         logs = log_samples(log)
+        assert logs["gpu_queue_timestamp_samples_delayed"][0]["gpu_busy_ms_per_frame"] == 235
         assert logs["periodic_frame_samples"][0]["gpu_wait_ms"] == 20
         assert logs["periodic_frame_samples"][1]["pending_pipelines"] == 7
         assert logs["steady_state_established"] is False

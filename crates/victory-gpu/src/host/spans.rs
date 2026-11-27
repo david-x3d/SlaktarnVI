@@ -26,6 +26,8 @@ pub(super) struct Spans {
     lists: Vec<ID3D12CommandList>,
     ticks_per_ms: f64,
     next: usize,
+    fence_values: [u64; SPANS],
+    skipped: u64,
     sums: Sums,
 }
 
@@ -74,7 +76,7 @@ static SPANS_MADE: Mutex<Option<Option<Spans>>> = Mutex::new(None);
 impl Host {
     /// The lists that go in front of and behind a submission about to be
     /// sent to the drawing queue, if stamps are asked for.
-    pub(super) fn span_lists(&self) -> Option<[ID3D12CommandList; 2]> {
+    pub(super) fn span_lists(&self, submission_fence: u64) -> Option<[ID3D12CommandList; 2]> {
         if !on() {
             return None;
         }
@@ -87,9 +89,16 @@ impl Host {
             })
             .as_mut()?;
         let i = spans.next;
+        // Never reset a query/readback slot while the GPU can still use it.
+        // Skip the diagnostic sample instead of introducing a new fence wait.
+        let complete = unsafe { self.fence.GetCompletedValue() };
+        if complete == u64::MAX || spans.fence_values[i] > complete {
+            spans.skipped += 1;
+            return None;
+        }
         spans.next = (i + 1) % SPANS;
-        // The stamps of the submission that had these lists, that many
-        // submissions ago: long done.
+        spans.fence_values[i] = submission_fence;
+        // The old submission's fence is complete; its readback is safe.
         // SAFETY: inside the mapping; written by the card at whole words.
         let (start, end) = unsafe {
             let at = (spans.data as *mut u64).add(2 * i);
@@ -139,6 +148,8 @@ impl Host {
                 lists,
                 ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
                 next: 0,
+                fence_values: [0; SPANS],
+                skipped: 0,
                 sums: Sums::default(),
             })
         }
@@ -198,6 +209,10 @@ pub(super) fn line(frames: f64) {
     let Some(Some(spans)) = made.as_mut() else {
         return;
     };
+    let skipped = std::mem::take(&mut spans.skipped);
+    if skipped > 0 {
+        tracing::info!(skipped, "GPU timestamp samples skipped because readback slots were in flight");
+    }
     let last = spans.sums.last;
     let s = std::mem::replace(&mut spans.sums, Sums { last, ..Sums::default() });
     let ms = |ticks: u64| ticks as f64 / spans.ticks_per_ms / frames;
