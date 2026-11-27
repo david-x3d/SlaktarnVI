@@ -21,13 +21,14 @@ def external(path):
     return path
 
 
-def report(path, warmup=0):
+def report(path, warmup=0, until=None):
     rows = []
     with open(path, newline="") as file:
         for row in csv.DictReader(file):
             try:
                 end, interval = int(row["elapsed_ns"]), int(row["interval_ns"])
-                if interval > 0 and end - interval >= warmup * 1e9:
+                if (interval > 0 and end - interval >= warmup * 1e9
+                        and (until is None or end <= until * 1e9)):
                     rows.append((interval, row))
             except (ValueError, TypeError, KeyError):
                 # Interrupted process may leave the final row incomplete.
@@ -46,16 +47,23 @@ def report(path, warmup=0):
     presents = sum_field("swapchain_present_delta")
     hits, misses = sum_field("shader_hit_delta"), sum_field("shader_miss_delta")
     loaded, made = sum_field("pipeline_load_delta"), sum_field("pipeline_make_delta")
+    draws, dropped = sum_field("draw_delta"), sum_field("dropped_work_delta")
+    dispatches = sum_field("dispatch_delta")
     return {
+        "window_seconds": {"from": warmup, "until": until},
+        "rendering_complete": False if dropped else None,
         "accepted_native_fps": len(rows) / total,
         "swapchain_present_rate": presents / total if presents is not None else None,
         "scanout_fps": None,
         "intervals": len(rows), "sample_seconds": total,
         "frame_ms": {"median": (intervals[(len(intervals)-1)//2] + intervals[len(intervals)//2])/2,
                      "p95": percentile(.95), "p99": percentile(.99)},
-        "draw_counter_delta": sum_field("draw_delta"),
-        "dispatch_counter_delta": sum_field("dispatch_delta"),
-        "dropped_work_delta": sum_field("dropped_work_delta"),
+        "draw_counter_delta": draws,
+        "dispatch_counter_delta": dispatches,
+        "dropped_work_delta": dropped,
+        "draws_per_accepted_present": draws / len(rows) if draws is not None else None,
+        "dispatches_per_accepted_present": dispatches / len(rows) if dispatches is not None else None,
+        "dropped_work_per_accepted_present": dropped / len(rows) if dropped is not None else None,
         "pipeline_library_loads": loaded,
         "pipeline_make_counter": made,
         "pipeline_library_load_fraction": loaded / (loaded + made) if loaded is not None and made is not None and loaded + made else None,
@@ -72,18 +80,32 @@ LOG_SAMPLE = re.compile(
     r"(?P<copy_mb>[\d.]+) MB, textures (?P<texture_ms>[\d.]+) ms "
     r"(?P<texture_mb>[\d.]+) MB; (?P<gpu_wait_ms>[\d.]+) (?:on the|waiting for the) "
     r"GPU; (?P<copyback_ms>[\d.]+) copying back (?P<copyback_mb>[\d.]+) MB\), "
-    r"(?P<draws>[\d.]+) draws/frame, dropped (?P<dropped>[\d.]+)")
+    r"(?P<draws>[\d.]+) draws/frame, dropped (?P<dropped>[\d.]+)"
+    r"(?: without a host pipeline \((?P<pending_pipelines>[\d.]+) being made\)"
+    r" and (?P<dropped_indirect>[\d.]+) indirect)?")
 
 
 def log_samples(path):
-    samples, reasons = [], []
+    samples, reasons, mapping, passes, budgets = [], [], [], [], []
     with open(path, errors="replace") as file:
         for line in file:
             if match := LOG_SAMPLE.search(line):
-                samples.append({k: float(v) for k, v in match.groupdict().items()})
+                samples.append({k: float(v) if v is not None else None
+                                for k, v in match.groupdict().items()})
             if match := re.search(r"dropped ([\d.]+)/frame without a host pipeline: (.*)", line):
                 reasons.append({"per_frame": float(match[1]), "reason": match[2].strip()})
-    return {"periodic_frame_samples": samples, "periodic_drop_reasons": reasons}
+            if match := re.search(r"new card memory waited for until it is mapped .*since the start: (\d+) times, ([\d.]+) ms, the longest ([\d.]+) ms", line):
+                mapping.append({"barriers": int(match[1]), "cumulative_ms": float(match[2]), "longest_ms": float(match[3])})
+            if match := re.search(r"the card: (\d+) MB in use of a budget of (\d+) MB, (\d+) MB of the PC's memory shared", line):
+                budgets.append({"local_used_mb": int(match[1]), "local_budget_mb": int(match[2]), "nonlocal_used_mb": int(match[3])})
+            if match := re.search(r"the card's time by command \(timing run\): ([\d.]+) ms a frame in ([\d.]+) commands a frame, the longest ([\d.]+) ms: (.*)", line):
+                passes.append({"gpu_timestamp_ms_per_frame": float(match[1]), "commands_per_frame": float(match[2]), "longest_ms": float(match[3]), "command": match[4].strip()})
+    return {"periodic_frame_samples": samples, "periodic_drop_reasons": reasons,
+            "mapping_barriers_last": mapping[-1] if mapping else None,
+            "gpu_memory_budget_samples": budgets,
+            "gpu_timestamp_command_samples": passes,
+            "steady_state_established": False if any(
+                s["pending_pipelines"] or s["dropped"] or s["dropped_indirect"] for s in samples[-3:]) else None}
 
 
 def hardware_summary(path):
@@ -153,10 +175,21 @@ def selftest():
         assert stats["swapchain_present_rate"] is None
         assert stats["shader_cache_hit_rate"] == 4 / 6
         assert report(path, .01)["intervals"] == 2
+        assert report(path, .01, .03)["intervals"] == 1
+        assert report(path)["rendering_complete"] is None
         assert stats["pipeline_library_load_fraction"] is None
         log = Path(tmp) / "run.log"
         log.write_text("10.0 fps, 100.0 ms/frame (2.0 preparing: copies 1.0 ms 2.0 MB, textures 3.0 ms 4.0 MB; 20.0 waiting for the GPU; 1.0 copying back 0.5 MB), 25 draws/frame, dropped 4\n")
-        assert log_samples(log)["periodic_frame_samples"][0]["gpu_wait_ms"] == 20
+        with log.open("a") as f:
+            f.write("10.0 fps, 100.0 ms/frame (2.0 preparing: copies 1.0 ms 2.0 MB, textures 3.0 ms 4.0 MB; 20.0 waiting for the GPU; 1.0 copying back 0.5 MB), 25 draws/frame, dropped 4 without a host pipeline (7 being made) and 2 indirect\n")
+            f.write("new card memory waited for until it is mapped (test), since the start: 100 times, 70.0 ms, the longest 2.0 ms\n")
+            f.write("the card's time by command (timing run): 1.25 ms a frame in 2.0 commands a frame, the longest 0.8 ms: draw [test]\n")
+        logs = log_samples(log)
+        assert logs["periodic_frame_samples"][0]["gpu_wait_ms"] == 20
+        assert logs["periodic_frame_samples"][1]["pending_pipelines"] == 7
+        assert logs["steady_state_established"] is False
+        assert logs["mapping_barriers_last"]["barriers"] == 100
+        assert logs["gpu_timestamp_command_samples"][0]["gpu_timestamp_ms_per_frame"] == 1.25
         hw = Path(tmp) / "hw.tsv"
         hw.write_text("gpu%\tvram_MiB\n50\t1000\n?\t2000\n")
         assert hardware_summary(hw)["vram_MiB"] == {"mean": 1500, "max": 2000}
@@ -170,6 +203,7 @@ def main():
     reader = sub.add_parser("report")
     reader.add_argument("csv", type=Path)
     reader.add_argument("--warmup", type=float, default=0)
+    reader.add_argument("--until", type=float)
     reader.add_argument("--log", type=Path)
     reader.add_argument("--hardware", type=Path)
     runner = sub.add_parser("run")
@@ -183,7 +217,7 @@ def main():
     if args.command == "selftest":
         selftest()
     elif args.command == "report":
-        stats = report(args.csv, args.warmup)
+        stats = report(args.csv, args.warmup, args.until)
         if args.log:
             stats["runtime_log"] = log_samples(args.log)
         if args.hardware:
