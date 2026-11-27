@@ -5187,7 +5187,7 @@ mod changed_records_tests {
 /// Whether both are shader views of one texture the title placed in
 /// memory: the same address and the same resource description, whatever
 /// part of it each shows.
-fn same_placed_texture(a: &View, b: &View) -> bool {
+pub(crate) fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
             // (Words 1 and 13 are the filler of the description's layout, not
